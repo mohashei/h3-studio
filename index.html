@@ -1,0 +1,713 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>H3 Studio</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="H3 Studio">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0b0c0f">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="manifest" href="manifest.webmanifest">
+<!--
+  MiniMax-H3 Ultra Fast, straight from the browser. Open this file (double-click); nothing to install.
+  It talks only to RunPod's queue API (api.runpod.ai), which allows browser requests, using the
+  queue endpoint from scripts/deploy_h3queue.sh. Keys stay in this browser's storage; use a RunPod
+  key restricted to that one endpoint.
+-->
+<style>
+:root {
+  --bg: #f6f6f8; --panel: #ffffff; --sunken: #eef0f3; --line: #dfe2e8; --text: #16181d; --mute: #626773;
+  --accent: #6d5ae6; --accent-text: #ffffff; --ok: #1f8a4c; --warn: #b26a00; --err: #c43c3c;
+  --stop-bg: #fbeaea; --stop-text: #a52f2f; --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 16px rgba(0,0,0,.05);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0b0c0f; --panel: #15171c; --sunken: #0f1115; --line: #2a2d35; --text: #e8e9ec; --mute: #9a9ea8;
+    --accent: #8b7cf6; --accent-text: #ffffff; --ok: #4cc47f; --warn: #e3a33b; --err: #f27878;
+    --stop-bg: #2a1414; --stop-text: #f6c4c4; --shadow: 0 1px 2px rgba(0,0,0,.4), 0 6px 20px rgba(0,0,0,.35);
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+       padding-bottom: env(safe-area-inset-bottom); -webkit-text-size-adjust: 100%; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; border-bottom: 1px solid var(--line); background: var(--panel);
+         position: sticky; top: 0; z-index: 5;
+         padding: calc(14px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right)) 14px calc(16px + env(safe-area-inset-left)); }
+header h1 { font-size: 17px; margin: 0; letter-spacing: -.01em; }
+header .sub { color: var(--mute); font-size: 13px; }
+.spacer { flex: 1; }
+.pill { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; padding: 5px 10px; border-radius: 999px; background: var(--sunken); border: 1px solid var(--line); white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--mute); }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
+.dot.pulse { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+main { display: grid; grid-template-columns: minmax(0, 380px) minmax(0, 1fr); gap: 16px; padding: 16px; max-width: 1280px; margin: 0 auto; }
+@media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } header .sub { display: none; } }
+@media (max-width: 520px) {
+  main { padding: 12px max(12px, env(safe-area-inset-left)) 12px max(12px, env(safe-area-inset-right)); gap: 12px; }
+  header .spacer { flex-basis: 0; }
+  .card { padding: 14px; }
+  button.small, a.button { padding: 8px 12px; }          /* comfortable tap targets */
+  .actions button, .actions select { min-height: 44px; }
+}
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; box-shadow: var(--shadow); min-width: 0; }
+.card + .card { margin-top: 16px; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--mute); margin: 0 0 10px; font-weight: 600; }
+label { display: block; font-size: 13px; color: var(--mute); margin: 12px 0 5px; }
+label:first-of-type { margin-top: 0; }
+input[type=text], input[type=password], input[type=number], select, textarea {
+  width: 100%; padding: 9px 11px; border-radius: 9px; border: 1px solid var(--line); background: var(--sunken); color: var(--text); font: inherit;
+}
+textarea { min-height: 110px; resize: vertical; }
+input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.row { display: flex; gap: 8px; align-items: center; }
+.row > * { min-width: 0; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+button { font: inherit; border-radius: 9px; border: 1px solid var(--line); background: var(--sunken); color: var(--text); padding: 9px 14px; cursor: pointer; }
+button:hover:not(:disabled) { filter: brightness(1.05); }
+button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; font-weight: 600; }
+button.stop { background: var(--stop-bg); color: var(--stop-text); border-color: transparent; font-weight: 600; }
+button.small { padding: 5px 10px; font-size: 13px; }
+button.full { width: 100%; }
+.hint { color: var(--mute); font-size: 13px; margin: 6px 0 0; }
+.frames { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.frame { position: relative; border: 1px dashed var(--line); border-radius: 10px; background: var(--sunken); aspect-ratio: 16 / 10; display: grid; place-items: center; overflow: hidden; cursor: pointer; color: var(--mute); font-size: 13px; text-align: center; padding: 6px; }
+.frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.frame .x { position: absolute; top: 4px; right: 4px; z-index: 1; padding: 2px 8px; font-size: 12px; }
+.actions { display: flex; gap: 8px; margin-top: 16px; }
+.actions button { flex: 1; }
+/* The video keeps its own shape (16:9, 9:16, 1:1, 21:9...): as wide as the panel allows, never taller than the window. */
+.stage { background: var(--sunken); border-radius: 12px; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.stage video { display: block; width: auto; height: auto; max-width: 100%; max-height: min(72vh, 900px); background: #000; }
+.stage .empty { color: var(--mute); padding: 16px; text-align: center; width: 100%; aspect-ratio: 16 / 9; display: grid; place-items: center; }
+.status { margin-top: 12px; }
+.status .line { display: flex; align-items: baseline; gap: 10px; }
+.status .msg { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.status .time { color: var(--mute); font-variant-numeric: tabular-nums; font-size: 13px; }
+.bar { height: 6px; border-radius: 99px; background: var(--sunken); overflow: hidden; margin-top: 8px; }
+.bar > div { height: 100%; width: 0; background: var(--accent); transition: width .4s ease; }
+.bar.indeterminate > div { width: 30%; animation: slide 1.4s ease-in-out infinite; }
+@keyframes slide { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+.batch { margin: 10px 0 0; padding-left: 22px; font-size: 13px; color: var(--mute); }
+.batch li { margin: 2px 0; overflow-wrap: anywhere; }
+.batch li.active { color: var(--text); }
+.batch li.bad { color: var(--err); }
+.report { color: var(--mute); font-size: 13px; margin-top: 10px; overflow-wrap: anywhere; }
+.error { color: var(--err); }
+.result-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+a.button { display: inline-block; text-decoration: none; color: var(--text); background: var(--sunken); border: 1px solid var(--line); border-radius: 9px; padding: 5px 10px; font-size: 13px; }
+.history { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
+.item { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--sunken); cursor: pointer; }
+.item video { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; display: block; background: #000; pointer-events: none; }
+.item .meta { padding: 7px 9px; font-size: 12px; color: var(--mute); }
+.item .meta b { color: var(--text); font-weight: 500; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--text); padding: 20px; width: min(460px, calc(100vw - 32px)); box-shadow: var(--shadow); }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+dialog h3 { margin: 0 0 4px; font-size: 17px; }
+.check { display: flex; gap: 8px; align-items: center; margin-top: 12px; font-size: 13px; color: var(--mute); }
+.hidden { display: none !important; }
+/* Last, so it wins over `font: inherit`: iOS Safari zooms into any field with text under 16px. */
+input[type], select, textarea { font-size: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>H3 Studio</h1>
+  <span class="sub">MiniMax-H3 Ultra Fast on RunPod</span>
+  <span class="spacer"></span>
+  <span class="pill" id="workerPill" title="RunPod worker state (checking it does not wake or bill the worker)"><span class="dot" id="workerDot"></span><span id="workerText">Checking…</span></span>
+  <button class="small" id="wakeBtn" title="Start a worker and load the model now, so your first generation starts immediately">Start worker</button>
+  <button class="small" id="settingsBtn" aria-label="Settings">Settings</button>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <h2>Shot</h2>
+      <label for="prompt">Prompt</label>
+      <textarea id="prompt" placeholder="A red fox trotting through a snowy pine forest at dawn, snow crunching underfoot"></textarea>
+
+      <label for="preset">Speed and quality</label>
+      <select id="preset"></select>
+      <p class="hint" id="presetHint"></p>
+
+      <label for="canvas">Format</label>
+      <select id="canvas"></select>
+
+      <label for="duration">Length: <span id="durationText"></span></label>
+      <input type="range" id="duration" min="2" max="14" step="1" value="5">
+
+      <label for="seed">Seed</label>
+      <div class="row">
+        <input type="number" id="seed" min="0" max="2147483647" value="42">
+        <button class="small" id="diceBtn" title="Random seed">Random</button>
+      </div>
+      <label class="check"><input type="checkbox" id="seedRandom" checked> New seed each time (the seed used is saved with each video)</label>
+
+      <label>Keyframes (optional)</label>
+      <div class="frames">
+        <div class="frame" id="firstFrame" tabindex="0" role="button" aria-label="Choose first frame">First frame</div>
+        <div class="frame" id="lastFrame" tabindex="0" role="button" aria-label="Choose last frame">Last frame</div>
+      </div>
+      <input type="file" id="firstInput" accept="image/*" class="hidden">
+      <input type="file" id="lastInput" accept="image/*" class="hidden">
+
+      <label for="loraUrl">LoRA (optional)</label>
+      <input type="text" id="loraUrl" spellcheck="false" autocomplete="off" placeholder="Civitai or Hugging Face link to an H3 LoRA">
+      <div id="loraOpts" class="hidden">
+        <label for="loraStrength">Strength: <span id="loraStrengthText"></span></label>
+        <input type="range" id="loraStrength" min="0" max="2" step="0.05" value="1">
+        <label for="loraSteps">Steps</label>
+        <input type="number" id="loraSteps" min="1" max="60" value="8">
+        <p class="hint" id="loraHint">Replaces the speed preset (one LoRA at a time). Speed LoRAs: their step count (3–8). Style LoRAs: 20–28.</p>
+      </div>
+
+      <div class="actions">
+        <button class="primary" id="generateBtn">Generate</button>
+        <select id="count" aria-label="Number of videos" title="Videos to generate, each with its own seed, one after another" style="width:auto;flex:0 0 auto">
+          <option value="1">×1</option><option value="2">×2</option><option value="3">×3</option><option value="4">×4</option>
+          <option value="6">×6</option><option value="8">×8</option>
+        </select>
+        <button class="stop hidden" id="stopBtn">Stop</button>
+      </div>
+      <p class="hint" id="costHint">Billed only while a worker runs: generation, plus 5 minutes idle after the last job.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <div class="stage" id="stage"><div class="empty">Your video will appear here.</div></div>
+      <div class="status hidden" id="status">
+        <div class="line"><span class="msg" id="statusMsg"></span><span class="time" id="statusTime"></span></div>
+        <div class="bar" id="bar"><div></div></div>
+      </div>
+      <ol class="batch hidden" id="batch"></ol>
+      <div class="result-actions hidden" id="resultActions"></div>
+      <div class="report" id="report"></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="margin-bottom:10px"><h2 style="margin:0">History</h2><span class="spacer"></span><span class="hint" style="margin:0">Saved in this browser</span></div>
+      <div class="history" id="history"></div>
+      <p class="hint" id="historyEmpty">Finished videos are kept here, so they stay playable after the worker shuts down.</p>
+    </div>
+  </section>
+</main>
+
+<dialog id="settings">
+  <form method="dialog" id="settingsForm">
+    <h3>Connect to RunPod</h3>
+    <p class="hint" style="margin:0 0 8px">Stored only in this browser. Nothing is sent anywhere except RunPod.</p>
+    <label for="cfgEndpoint">Queue endpoint ID</label>
+    <input type="text" id="cfgEndpoint" autocomplete="off" spellcheck="false" placeholder="e.g. abc123xyz" required>
+    <label for="cfgRunpod">RunPod API key</label>
+    <input type="password" id="cfgRunpod" autocomplete="off" placeholder="rpa_…" required>
+    <p class="hint">Use a restricted key (RunPod → Settings → API Keys → Restricted) that can only use this endpoint.</p>
+    <label for="cfgH3">H3 API key</label>
+    <input type="password" id="cfgH3" autocomplete="off" placeholder="h3_…" required>
+    <label for="cfgCivitai">Civitai API token (optional)</label>
+    <input type="password" id="cfgCivitai" autocomplete="off" placeholder="Only needed for LoRAs Civitai won't serve anonymously">
+    <label class="check"><input type="checkbox" id="cfgRemember" checked> Remember on this computer</label>
+    <div class="actions">
+      <button type="button" id="forgetBtn">Forget keys</button>
+      <button class="primary" value="save">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+
+  // ---------------------------------------------------------------- defaults (refreshed from the worker)
+  const DEFAULT_PRESET = "HyperFlow 8-step — best turbo";
+  let PRESETS = [
+    { value: "Balanced — best overall (recommended)", steps: 28, description: "Full quality schedule with conservative cache acceleration." },
+    { value: "Turbo 8-step — faster, cleaner", steps: 8, description: "The Space's distilled eight-step path." },
+    { value: "HyperFlow 8-step — best turbo", steps: 8, description: "Video Rebirth HyperFlow on its own 8-step schedule; closest turbo to full H3." },
+    { value: "Turbo 4-step — fastest, more artifacts", steps: 4, description: "Four-step preview; maximum speed with some detail loss." },
+    { value: "LightX2V 8-step — v1.0, full rank", steps: 8, description: "ModelTC LightX2V 8-step v1.0 (544p), full-rank LoRA." },
+    { value: "Kijai 8-step — lightx2v v1.0, compact", steps: 8, description: "The same LightX2V 8-step v1.0, Kijai's rank-reduced ComfyUI version." },
+    { value: "TaoMate 3-step — fastest, experimental", steps: 3, description: "TaoLive 3-step LoRA, full rank. Text-to-video; roughest output." },
+    { value: "Exact 28-step — maximum fidelity", steps: 28, description: "Dense reference path, no approximate caching." },
+    { value: "Max quality 50-step — slowest", steps: 50, description: "The reference 50-point schedule, every step exact, no LoRA." },
+    { value: "Ultra cache — experimental speed", steps: 28, description: "Aggressive forecasting on the full schedule." },
+  ];
+  let CANVASES = ["960x544 · 16:9 fast", "1024x576 · 16:9 fast", "1152x640 · 16:9", "1280x704 · 16:9", "1344x768 · 16:9 full",
+    "544x960 · 9:16 fast", "640x1152 · 9:16", "768x1344 · 9:16 full", "544x544 · 1:1 fast", "768x768 · 1:1 full",
+    "768x576 · 4:3 fast", "1024x768 · 4:3 full", "576x768 · 3:4 fast", "768x1024 · 3:4 full", "1152x512 · 21:9 fast", "1536x672 · 21:9 full"];
+
+  // ---------------------------------------------------------------- storage (all optional)
+  const store = {
+    get(k, fallback) { try { const v = localStorage.getItem("h3studio." + k); return v == null ? fallback : JSON.parse(v); } catch { return fallback; } },
+    set(k, v) { try { localStorage.setItem("h3studio." + k, JSON.stringify(v)); } catch {} },
+    del(k) { try { localStorage.removeItem("h3studio." + k); } catch {} },
+  };
+  let cfg = store.get("cfg", null) || { endpoint: "", runpodKey: "", h3Key: "" };
+
+  // ---------------------------------------------------------------- RunPod queue API
+  const api = async (method, path, body) => {
+    const base = store.get("apiBase", "https://api.runpod.ai");   // override exists only for local testing
+    const res = await fetch(`${base}/v2/${encodeURIComponent(cfg.endpoint)}${path}`, {
+      method, headers: { Authorization: `Bearer ${cfg.runpodKey}`, "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await res.text();
+    let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    if (!res.ok) throw new Error(res.status === 401 ? "RunPod rejected the API key (check Settings)." : (data.error || data.detail || `RunPod error ${res.status}`));
+    return data;
+  };
+  const connected = () => cfg.endpoint && cfg.runpodKey && cfg.h3Key;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // ---------------------------------------------------------------- form
+  const presetSel = $("preset"), canvasSel = $("canvas"), duration = $("duration"), seed = $("seed");
+  function fillSelects() {
+    const keepP = presetSel.value || store.get("preset", DEFAULT_PRESET), keepC = canvasSel.value || store.get("canvas", CANVASES[0]);
+    presetSel.innerHTML = ""; canvasSel.innerHTML = "";
+    for (const p of PRESETS) {
+      const o = document.createElement("option"); o.value = p.value;
+      const [name, tag] = p.value.split("—").map((s) => s.trim());
+      o.textContent = `${name}${tag ? " · " + tag.replace(/\s*\(recommended\)/i, "") : ""} (${p.steps} steps)`;
+      presetSel.append(o);
+    }
+    for (const c of CANVASES) { const o = document.createElement("option"); o.value = o.textContent = c; canvasSel.append(o); }
+    const renamed = { "Kijai 8-step — lightx2v v1.0": "Kijai 8-step — lightx2v v1.0, compact" };
+    const wantP = renamed[keepP] || keepP;
+    presetSel.value = PRESETS.some((p) => p.value === wantP) ? wantP : DEFAULT_PRESET;
+    canvasSel.value = CANVASES.includes(keepC) ? keepC : CANVASES[0];
+    showPresetHint();
+  }
+  function showPresetHint() { const p = PRESETS.find((x) => x.value === presetSel.value); $("presetHint").textContent = p ? p.description || "" : ""; }
+  function showDuration() { $("durationText").textContent = `${duration.value} s`; }
+  presetSel.onchange = () => { store.set("preset", presetSel.value); showPresetHint(); };
+  canvasSel.onchange = () => store.set("canvas", canvasSel.value);
+  duration.oninput = () => { showDuration(); store.set("duration", duration.value); };
+  seed.onchange = () => store.set("seed", seed.value);
+  const seedRandom = $("seedRandom"), count = $("count");
+  seedRandom.checked = store.get("seedRandom", true);
+  seedRandom.onchange = () => store.set("seedRandom", seedRandom.checked);
+  count.value = String(store.get("count", 1));
+  count.onchange = () => store.set("count", Number(count.value));
+  const randomSeed = () => Math.floor(Math.random() * 2 ** 31);
+  $("diceBtn").onclick = () => { seed.value = Math.floor(Math.random() * 2 ** 31); store.set("seed", seed.value); };
+  $("prompt").value = store.get("prompt", "");
+  $("prompt").oninput = () => store.set("prompt", $("prompt").value);
+  duration.value = store.get("duration", 5); seed.value = store.get("seed", 42);
+  const savedConfig = store.get("serverConfig", null);
+  if (savedConfig) applyServerConfig(savedConfig);
+  fillSelects(); showDuration();
+
+  function applyServerConfig(c) {
+    if (Array.isArray(c.presets) && c.presets.length) PRESETS = c.presets.filter((p) => !p.custom).map((p) => ({ value: p.value, steps: p.steps, description: p.description }));
+    if (Array.isArray(c.canvases) && c.canvases.length) CANVASES = c.canvases.map((x) => x.label || x);
+    if (c.duration) { duration.min = c.duration.min ?? 2; duration.max = c.duration.max ?? 14; }
+  }
+
+  // Keyframes: downscaled in the browser so a job stays well under RunPod's 10 MB input limit.
+  const frames = { first: null, last: null };
+  function setupFrame(which, box, input) {
+    box.onclick = (e) => { if (!e.target.classList.contains("x")) input.click(); };
+    box.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } };
+    input.onchange = async () => {
+      const file = input.files[0]; input.value = "";
+      if (!file) return;
+      frames[which] = await shrink(file, 2048);
+      box.innerHTML = `<img alt=""><button class="x small" type="button" aria-label="Remove">×</button>`;
+      box.querySelector("img").src = frames[which];
+      box.querySelector(".x").onclick = (e) => { e.stopPropagation(); frames[which] = null; box.textContent = which === "first" ? "First frame" : "Last frame"; };
+    };
+  }
+  function shrink(file, max) {
+    return new Promise((resolve, reject) => {
+      const img = new Image(), url = URL.createObjectURL(file);
+      img.onload = () => {
+        const s = Math.min(1, max / Math.max(img.width, img.height));
+        const c = document.createElement("canvas"); c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
+        c.getContext("2d").drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url);
+        resolve(c.toDataURL("image/jpeg", 0.92));
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Could not read that image.")); };
+      img.src = url;
+    });
+  }
+  setupFrame("first", $("firstFrame"), $("firstInput"));
+  setupFrame("last", $("lastFrame"), $("lastInput"));
+
+  // Custom LoRA. The worker downloads it (public https, .safetensors, 2 GB max); one LoRA replaces the preset.
+  const loraUrl = $("loraUrl"), loraStrength = $("loraStrength"), loraSteps = $("loraSteps");
+  loraUrl.value = store.get("loraUrl", ""); loraStrength.value = store.get("loraStrength", 1); loraSteps.value = store.get("loraSteps", 8);
+  function showLora() {
+    const on = loraUrl.value.trim() !== "";
+    $("loraOpts").classList.toggle("hidden", !on);
+    presetSel.disabled = on;
+    $("loraStrengthText").textContent = Number(loraStrength.value).toFixed(2);
+    if (on) { try { downloadUrl(loraUrl.value); $("loraHint").classList.remove("error"); $("loraHint").textContent = "Replaces the speed preset (one LoRA at a time). Speed LoRAs: their step count (3–8). Style LoRAs: 20–28."; }
+              catch (e) { $("loraHint").textContent = e.message; $("loraHint").classList.add("error"); } }
+  }
+  loraUrl.oninput = () => { store.set("loraUrl", loraUrl.value.trim()); showLora(); };
+  loraStrength.oninput = () => { store.set("loraStrength", loraStrength.value); showLora(); };
+  loraSteps.onchange = () => store.set("loraSteps", loraSteps.value);
+  showLora();
+
+  /** Page links -> direct download links. Throws with a helpful message when it can't tell which file. */
+  function downloadUrl(raw) {
+    let u; try { u = new URL(raw.trim()); } catch { throw new Error("That isn't a link. Paste the LoRA's Civitai or Hugging Face URL."); }
+    if (u.protocol !== "https:") throw new Error("The link must start with https://");
+    if (u.hostname.endsWith("huggingface.co")) {
+      const m = u.pathname.match(/^\/([^/]+\/[^/]+)\/(?:blob|resolve)\/([^/]+)\/(.+\.safetensors)$/);
+      if (!m) throw new Error("Hugging Face: open the .safetensors file in the repo's Files tab and copy that page's link.");
+      return `https://huggingface.co/${m[1]}/resolve/${m[2]}/${m[3]}`;
+    }
+    if (u.hostname.endsWith("civitai.com")) {
+      let version = null;
+      const dl = u.pathname.match(/^\/api\/download\/models\/(\d+)/);
+      if (dl) version = dl[1];
+      else if (/^\/models\/\d+/.test(u.pathname)) version = u.searchParams.get("modelVersionId");
+      if (!version) throw new Error("Civitai: pick the version on the model page first (the link needs ?modelVersionId=…), or copy its Download link.");
+      const out = new URL(`https://civitai.com/api/download/models/${version}`);
+      out.searchParams.set("type", "Model"); out.searchParams.set("format", "SafeTensor");
+      if (cfg.civitaiToken) out.searchParams.set("token", cfg.civitaiToken);
+      return out.toString();
+    }
+    return u.toString();   // any other public https link straight to a .safetensors file
+  }
+
+  // ---------------------------------------------------------------- worker status (RunPod /health: never wakes or bills the worker)
+  let health = null;
+  async function pollHealth() {
+    if (!connected()) { setPill("", "Not connected"); return; }
+    try {
+      health = await api("GET", "/health");
+      const w = health.workers || {}, j = health.jobs || {};
+      if ((j.inProgress || 0) > 0 || (w.running || 0) > 0) setPill("ok pulse", "Working");
+      else if ((w.ready || 0) + (w.idle || 0) > 0) setPill("ok", "Worker up");
+      else if ((w.initializing || 0) > 0) setPill("warn pulse", "Starting");
+      else if ((w.unhealthy || 0) > 0) setPill("err", "Worker unhealthy");
+      else setPill("", "Asleep (not billing)");
+    } catch (e) { setPill("err", e.message.length > 40 ? "RunPod unreachable" : e.message); }
+  }
+  function setPill(cls, text) { $("workerDot").className = "dot " + cls; $("workerText").textContent = text; }
+  setInterval(() => { if (!document.hidden) pollHealth(); }, 10000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) pollHealth(); });
+
+  // ---------------------------------------------------------------- jobs
+  let current = null;       // { id, kind, started, stopping }
+  const bar = $("bar");
+  function showStatus(msg, { error = false, progress = null } = {}) {
+    $("status").classList.remove("hidden");
+    $("statusMsg").textContent = msg; $("statusMsg").classList.toggle("error", error);
+    bar.classList.toggle("indeterminate", progress === null && !error && !!current);
+    bar.firstElementChild.style.width = progress === null ? "" : `${Math.round(progress * 100)}%`;
+    if (!current) bar.classList.remove("indeterminate");
+  }
+  setInterval(() => { if (current) $("statusTime").textContent = fmtTime((Date.now() - current.started) / 1000); }, 500);
+  const fmtTime = (s) => s < 60 ? `${Math.floor(s)}s` : `${Math.floor(s / 60)}m ${String(Math.floor(s % 60)).padStart(2, "0")}s`;
+
+  function setBusy(busy, kind) {
+    $("generateBtn").disabled = busy; $("wakeBtn").disabled = busy;
+    $("stopBtn").classList.toggle("hidden", !(busy && kind === "generate"));
+  }
+
+  async function runJob(kind, input) {
+    if (!connected()) { openSettings(); return null; }
+    current = { id: null, kind, started: Date.now(), stopping: false };
+    setBusy(true, kind);
+    try {
+      const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } });
+      current.id = job.id;
+      return await follow(job.id);
+    } finally {
+      current = null; setBusy(false); pollHealth();
+    }
+  }
+
+  async function follow(id) {
+    let delay = 1500;
+    for (;;) {
+      const s = await api("GET", `/status/${id}`);
+      if (s.status === "IN_QUEUE") {
+        const w = (health && health.workers) || {};
+        const warm = (w.ready || 0) + (w.idle || 0) + (w.running || 0) > 0;
+        showStatus(current.stopping ? "Cancelling…" : warm ? "Queued" : "Waking a GPU worker. A start from sleep takes a few minutes…");
+      } else if (s.status === "IN_PROGRESS") {
+        const text = typeof s.output === "string" ? s.output : "Working…";
+        const m = text.match(/step (\d+)\/(\d+)/);
+        showStatus(current.stopping ? "Stopping at the next step…" : text, { progress: m ? Number(m[1]) / Number(m[2]) : null });
+      } else if (s.status === "COMPLETED") {
+        if (s.output && s.output.error) throw new Error(s.output.error);
+        return s.output || {};
+      } else if (s.status === "FAILED") {
+        throw new Error(parseError(s));
+      } else if (s.status === "CANCELLED") {
+        throw new Error("Generation cancelled.");
+      } else if (s.status === "TIMED_OUT") {
+        throw new Error("The job timed out on RunPod.");
+      }
+      await sleep(delay); delay = Math.min(delay + 250, 3000);
+    }
+  }
+  function parseError(s) {
+    const e = s.error ?? (s.output && s.output.error);
+    if (!e) return "The job failed.";
+    if (typeof e === "string") { try { const j = JSON.parse(e); return j.error_message || j.error || e; } catch { return e; } }
+    return e.error_message || e.error || JSON.stringify(e);
+  }
+
+  $("wakeBtn").onclick = async () => {
+    showStatus("Starting a worker and loading the model…");
+    try {
+      const out = await runJob("warmup", { action: "warmup" });
+      if (!out) return;
+      if (out.config) { store.set("serverConfig", out.config); applyServerConfig(out.config); fillSelects(); }
+      showStatus("Worker ready. It stays up 5 minutes after the last job.", { progress: 1 });
+    } catch (e) { showStatus(e.message, { error: true }); }
+  };
+
+  // A "batch" is 1..8 generate jobs, each with its own seed. RunPod queues them; the worker runs them one
+  // after another (the Space caches the prompt encoding between them). Each result lands in History as it finishes.
+  let batch = null;
+
+  $("generateBtn").onclick = async () => {
+    if (!connected()) { openSettings(); return; }
+    const prompt = $("prompt").value.trim();
+    if (!prompt) { $("prompt").focus(); showStatus("Write a prompt first.", { error: true }); return; }
+    const base = { action: "generate", prompt, preset: presetSel.value, canvas: canvasSel.value, duration: Number(duration.value) };
+    if (frames.first) base.image = frames.first;
+    if (frames.last) base.last_image = frames.last;
+    if (loraUrl.value.trim()) {
+      try { base.lora = { url: downloadUrl(loraUrl.value), strength: Number(loraStrength.value), steps: Number(loraSteps.value) || 8 }; }
+      catch (e) { showStatus(e.message, { error: true }); loraUrl.focus(); return; }
+    }
+    const n = Math.max(1, Math.min(8, Number(count.value) || 1));
+    const first = seedRandom.checked ? randomSeed() : (Number(seed.value) || 0);
+    const seeds = Array.from({ length: n }, (_, i) => seedRandom.checked ? (i ? randomSeed() : first) : first + i);
+    seed.value = seeds[0]; store.set("seed", seed.value);
+
+    batch = current = { kind: "generate", started: Date.now(), stopping: false, jobs: [] };
+    setBusy(true, "generate"); showStatus(n > 1 ? `Sending ${n} jobs…` : "Sending…");
+    try {
+      for (const sd of seeds) {
+        const input = { ...base, seed: sd };
+        const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } });
+        const { image, last_image, ...meta } = input;          // keep localStorage small
+        batch.jobs.push({ id: job.id, seed: sd, input: meta, state: "IN_QUEUE", text: "Queued", done: false });
+      }
+      saveBatch();
+      await pollBatch(batch);
+    } catch (e) {
+      showStatus(e.message, { error: true });
+      if (batch && batch.jobs.length) await pollBatch(batch).catch(() => {});
+    } finally {
+      finishBatch();
+    }
+  };
+
+  function saveBatch() { if (batch) store.set("batch", { started: batch.started, jobs: batch.jobs.map(({ id, seed, input }) => ({ id, seed, input })) }); }
+  function finishBatch() { batch = current = null; store.del("batch"); store.del("currentJob"); setBusy(false); pollHealth(); }
+
+  async function pollBatch(b) {
+    let delay = 1500;
+    while (b.jobs.some((j) => !j.done)) {
+      await Promise.all(b.jobs.filter((j) => !j.done).map(async (j) => {
+        let s;
+        try { s = await api("GET", `/status/${j.id}`); } catch (e) { j.text = e.message; return; }
+        j.state = s.status;
+        if (s.status === "IN_QUEUE") j.text = b.stopping ? "Cancelling…" : "Queued";
+        else if (s.status === "IN_PROGRESS") j.text = b.stopping ? "Stopping…" : (typeof s.output === "string" ? s.output : "Working…");
+        else if (s.status === "COMPLETED") {
+          j.done = true;
+          if (s.output && s.output.error) { j.bad = true; j.text = s.output.error; }
+          else { j.text = `Done in ${fmtTime((s.output && s.output.seconds) || 0)}`; await showResult(s.output || {}, { ...j.input, seed: j.seed }); }
+        } else {
+          j.done = true; j.bad = true;
+          j.text = s.status === "FAILED" ? parseError(s) : s.status === "CANCELLED" ? "Cancelled." : "Timed out on RunPod.";
+        }
+      }));
+      renderBatch(b);
+      if (b.jobs.some((j) => !j.done)) { await sleep(delay); delay = Math.min(delay + 250, 3000); }
+    }
+  }
+
+  function renderBatch(b) {
+    const n = b.jobs.length, done = b.jobs.filter((j) => j.done && !j.bad).length;
+    const active = b.jobs.find((j) => j.state === "IN_PROGRESS" && /step \d+\/\d+/.test(j.text)) || b.jobs.find((j) => j.state === "IN_PROGRESS");
+    const list = $("batch");
+    list.classList.toggle("hidden", n < 2);
+    list.innerHTML = "";
+    for (const j of b.jobs) {
+      const li = document.createElement("li");
+      li.textContent = `seed ${j.seed} · ${j.text}`;
+      if (j === active) li.className = "active"; else if (j.bad) li.className = "bad";
+      list.append(li);
+    }
+    if (b.jobs.every((j) => j.done)) {
+      const bad = b.jobs.filter((j) => j.bad);
+      if (n === 1) showStatus(bad.length ? b.jobs[0].text : b.jobs[0].text + " on the GPU.", { error: bad.length > 0, progress: bad.length ? null : 1 });
+      else showStatus(`${done} of ${n} done${bad.length ? `, ${bad.length} stopped or failed` : ""}.`, { error: done === 0, progress: done ? 1 : null });
+      return;
+    }
+    if (active) {
+      const m = active.text.match(/step (\d+)\/(\d+)/);
+      const which = n > 1 ? `Video ${b.jobs.indexOf(active) + 1} of ${n}: ` : "";
+      showStatus(which + active.text, { progress: m ? Number(m[1]) / Number(m[2]) : null });
+    } else {
+      const w = (health && health.workers) || {};
+      const warm = (w.ready || 0) + (w.idle || 0) + (w.running || 0) > 0;
+      showStatus(b.stopping ? "Cancelling…" : warm ? (n > 1 ? `Queued (${done} of ${n} done)` : "Queued")
+                                                 : "Waking a GPU worker. A start from sleep takes a few minutes…");
+    }
+  }
+
+  $("stopBtn").onclick = async () => {
+    const b = batch;
+    if (!b || b.stopping) return;
+    b.stopping = true; $("stopBtn").disabled = true; renderBatch(b);
+    try {
+      const open = b.jobs.filter((j) => !j.done);
+      // Not started yet: RunPod drops them. Started (or waiting on the worker): the worker stops them at the next step.
+      await Promise.all(open.filter((j) => j.state === "IN_QUEUE").map((j) => api("POST", `/cancel/${j.id}`).catch(() => {})));
+      const started = open.filter((j) => j.state !== "IN_QUEUE").map((j) => j.id);
+      if (started.length) await api("POST", "/run", { input: { action: "cancel", job_ids: started, api_key: cfg.h3Key } });
+    } catch (e) { showStatus("Stop failed: " + e.message, { error: true }); b.stopping = false; }
+    finally { $("stopBtn").disabled = false; }
+  };
+
+  // Resume a batch that was running when the page was closed or reloaded.
+  store.del("currentJob");                         // single-job format from older versions of this page
+  const pending = store.get("batch", null);
+  if (pending && pending.jobs && pending.jobs.length && connected()) {
+    batch = current = { kind: "generate", started: pending.started, stopping: false,
+                        jobs: pending.jobs.map((j) => ({ ...j, state: "IN_QUEUE", text: "Reconnecting…", done: false })) };
+    setBusy(true, "generate"); showStatus("Reconnecting to your jobs…");
+    pollBatch(batch).catch((e) => showStatus(e.message, { error: true })).finally(finishBatch);
+  }
+
+  // ---------------------------------------------------------------- results + history (IndexedDB, optional)
+  async function showResult(out, input) {
+    let blob;
+    if (out.video_b64) {
+      const bin = atob(out.video_b64), bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      blob = new Blob([bytes], { type: "video/mp4" });
+    } else if (out.video_url) {
+      try { blob = await (await fetch(out.video_url)).blob(); } catch { blob = null; }
+    }
+    const entry = { id: Date.now(), created: new Date().toISOString(), prompt: input.prompt || "(resumed job)",
+                    preset: input.preset || "", canvas: input.canvas || "", duration: input.duration, seed: out.seed ?? input.seed,
+                    lora: input.lora ? { link: loraUrl.value.trim(), strength: input.lora.strength, steps: input.lora.steps } : null,
+                    report: out.report || "", blob, url: out.video_url || null };
+    play(entry);
+    if (blob) { await db.put(entry); renderHistory(); }
+  }
+
+  let objectUrl = null;
+  function play(entry) {
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    const src = entry.blob ? (objectUrl = URL.createObjectURL(entry.blob)) : entry.url;
+    $("stage").innerHTML = "";
+    const v = document.createElement("video"); v.controls = true; v.autoplay = true; v.loop = true; v.playsInline = true; v.src = src;
+    $("stage").append(v);
+    $("report").textContent = [entry.prompt, entry.report].filter(Boolean).join("  ·  ");
+    const acts = $("resultActions"); acts.classList.remove("hidden"); acts.innerHTML = "";
+    const a = document.createElement("a"); a.className = "button"; a.href = src; a.download = fileName(entry); a.textContent = "Download";
+    acts.append(a);
+    // iPhone/iPad: the share sheet offers "Save Video" straight to Photos.
+    if (entry.blob && navigator.canShare) {
+      const file = new File([entry.blob], fileName(entry), { type: "video/mp4" });
+      if (navigator.canShare({ files: [file] })) {
+        const share = document.createElement("button"); share.className = "small"; share.textContent = "Save to Photos / Share";
+        share.onclick = () => navigator.share({ files: [file] }).catch(() => {});
+        acts.append(share);
+      }
+    }
+    const reuse = document.createElement("button"); reuse.className = "small"; reuse.textContent = "Reuse settings";
+    reuse.onclick = () => {
+      if (entry.prompt && entry.prompt !== "(resumed job)") $("prompt").value = entry.prompt;
+      if (entry.preset) presetSel.value = entry.preset;
+      if (entry.canvas) canvasSel.value = entry.canvas;
+      if (entry.duration) { duration.value = entry.duration; showDuration(); }
+      if (entry.seed != null) seed.value = entry.seed;
+      loraUrl.value = entry.lora ? entry.lora.link : "";
+      if (entry.lora) { loraStrength.value = entry.lora.strength; loraSteps.value = entry.lora.steps; }
+      store.set("loraUrl", loraUrl.value); showLora(); showPresetHint();
+    };
+    acts.append(reuse);
+    if (entry.id && entry.blob) {
+      const del = document.createElement("button"); del.className = "small"; del.textContent = "Delete";
+      del.onclick = async () => { await db.del(entry.id); renderHistory(); $("stage").innerHTML = '<div class="empty">Deleted.</div>'; acts.classList.add("hidden"); $("report").textContent = ""; };
+      acts.append(del);
+    }
+  }
+  const fileName = (e) => `h3-${(e.created || "").slice(0, 16).replace(/[:T]/g, "-")}-seed${e.seed ?? "x"}.mp4`;
+
+  const db = (() => {
+    let handle = null;
+    const open = () => handle || (handle = new Promise((resolve) => {
+      try {
+        const r = indexedDB.open("h3studio", 1);
+        r.onupgradeneeded = () => r.result.createObjectStore("videos", { keyPath: "id" });
+        r.onsuccess = () => resolve(r.result); r.onerror = () => resolve(null);
+      } catch { resolve(null); }
+    }));
+    const tx = async (mode, fn) => {
+      const d = await open(); if (!d) return null;
+      return new Promise((resolve) => {
+        try { const t = d.transaction("videos", mode); const req = fn(t.objectStore("videos")); t.oncomplete = () => resolve(req && req.result); t.onerror = () => resolve(null); }
+        catch { resolve(null); }
+      });
+    };
+    return {
+      all: async () => ((await tx("readonly", (s) => s.getAll())) || []).sort((a, b) => b.id - a.id),
+      put: async (e) => { await tx("readwrite", (s) => s.put(e)); const all = await db.all(); for (const old of all.slice(40)) await db.del(old.id); },
+      del: (id) => tx("readwrite", (s) => s.delete(id)),
+    };
+  })();
+
+  const thumbUrls = [];
+  async function renderHistory() {
+    const items = await db.all();
+    thumbUrls.splice(0).forEach((u) => URL.revokeObjectURL(u));
+    const box = $("history"); box.innerHTML = "";
+    $("historyEmpty").classList.toggle("hidden", items.length > 0);
+    for (const e of items) {
+      const el = document.createElement("div"); el.className = "item"; el.tabIndex = 0; el.setAttribute("role", "button");
+      const v = document.createElement("video"); v.muted = true; v.preload = "metadata";
+      const u = URL.createObjectURL(e.blob); thumbUrls.push(u); v.src = u + "#t=0.5";
+      const meta = document.createElement("div"); meta.className = "meta";
+      const b = document.createElement("b"); b.textContent = e.prompt;
+      meta.append(b, document.createTextNode(`${e.lora ? "Custom LoRA" : (e.preset || "").split("—")[0].trim()} · seed ${e.seed ?? "?"}`));
+      el.append(v, meta);
+      el.onclick = () => play(e); el.onkeydown = (k) => { if (k.key === "Enter") play(e); };
+      box.append(el);
+    }
+  }
+  renderHistory();
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch {}
+
+  // ---------------------------------------------------------------- settings
+  const dlg = $("settings");
+  function openSettings() {
+    $("cfgEndpoint").value = cfg.endpoint; $("cfgRunpod").value = cfg.runpodKey; $("cfgH3").value = cfg.h3Key;
+    $("cfgCivitai").value = cfg.civitaiToken || "";
+    dlg.showModal();
+  }
+  $("settingsBtn").onclick = openSettings;
+  $("settingsForm").onsubmit = () => {
+    cfg = { endpoint: $("cfgEndpoint").value.trim(), runpodKey: $("cfgRunpod").value.trim(), h3Key: $("cfgH3").value.trim(),
+            civitaiToken: $("cfgCivitai").value.trim() };
+    if ($("cfgRemember").checked) store.set("cfg", cfg); else store.del("cfg");
+    pollHealth();
+  };
+  $("forgetBtn").onclick = () => { store.del("cfg"); cfg = { endpoint: "", runpodKey: "", h3Key: "" }; dlg.close(); setPill("", "Not connected"); };
+
+  if (!connected()) openSettings(); else pollHealth();
+})();
+</script>
+</body>
+</html>
