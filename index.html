@@ -611,7 +611,12 @@ input[type], select, textarea { font-size: 16px; }
     if (objectUrl) URL.revokeObjectURL(objectUrl);
     const src = entry.blob ? (objectUrl = URL.createObjectURL(entry.blob)) : entry.url;
     $("stage").innerHTML = "";
-    const v = document.createElement("video"); v.controls = true; v.autoplay = true; v.loop = true; v.playsInline = true; v.src = src;
+    const v = document.createElement("video"); v.controls = true; v.autoplay = true; v.loop = true; v.playsInline = true;
+    // Remember mute (and volume, where the browser allows setting it; iOS doesn't) across videos and visits.
+    v.muted = store.get("muted", false);
+    const vol = store.get("volume", 1); if (vol >= 0 && vol <= 1) v.volume = vol;
+    v.addEventListener("volumechange", () => { store.set("muted", v.muted); store.set("volume", v.volume); });
+    v.src = src;
     $("stage").append(v);
     $("report").textContent = [entry.prompt, entry.report].filter(Boolean).join("  ·  ");
     const acts = $("resultActions"); acts.classList.remove("hidden"); acts.innerHTML = "";
