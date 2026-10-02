@@ -78,6 +78,10 @@ button.full { width: 100%; }
 .frame { position: relative; border: 1px dashed var(--line); border-radius: 10px; background: var(--sunken); aspect-ratio: 16 / 10; display: grid; place-items: center; overflow: hidden; cursor: pointer; color: var(--mute); font-size: 13px; text-align: center; padding: 6px; }
 .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .frame .x { position: absolute; top: 4px; right: 4px; z-index: 1; padding: 2px 8px; font-size: 12px; }
+.frame .paste { position: absolute; bottom: 6px; left: 50%; transform: translateX(-50%); padding: 4px 12px; font-size: 13px; }
+.frame small { font-size: 11px; opacity: .8; }
+.frame > span { margin-bottom: 28px; line-height: 1.3; }
+.frame.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--sunken)); }
 .actions { display: flex; gap: 8px; margin-top: 16px; }
 .actions button { flex: 1; }
 /* The video keeps its own shape (16:9, 9:16, 1:1, 21:9...): as wide as the panel allows, never taller than the window. */
@@ -311,18 +315,69 @@ input[type], select, textarea { font-size: 16px; }
 
   // Keyframes: downscaled in the browser so a job stays well under RunPod's 10 MB input limit.
   const frames = { first: null, last: null };
+  const slots = {};                                       // which -> { box, input }
+  let lastSlot = "first";                                 // the slot you touched last gets a ⌘V paste
+  const LABEL = { first: "First frame", last: "Last frame" };
+
+  function emptySlot(which) {
+    const { box } = slots[which];
+    frames[which] = null;
+    box.innerHTML = `<span>${LABEL[which]}<br><small>tap to choose · drop · paste</small></span>` +
+                    `<button class="paste small" type="button" aria-label="Paste ${LABEL[which].toLowerCase()} from clipboard">Paste</button>`;
+    box.querySelector(".paste").onclick = (e) => { e.stopPropagation(); lastSlot = which; pasteFromClipboard(which); };
+  }
+
+  async function setFrame(which, blob) {
+    const { box } = slots[which];
+    try { frames[which] = await shrink(blob, 2048); }
+    catch (e) { showStatus(e.message, { error: true }); return; }
+    box.innerHTML = `<img alt=""><button class="x small" type="button" aria-label="Remove">×</button>`;
+    box.querySelector("img").src = frames[which];
+    box.querySelector(".x").onclick = (e) => { e.stopPropagation(); emptySlot(which); };
+  }
+
+  // Async clipboard (Paste button): Safari asks with its own "Paste" bubble; Chrome may ask for permission.
+  async function pasteFromClipboard(which) {
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.read) throw new Error("This browser can't read images from the clipboard here; use ⌘V or choose a file.");
+      for (const item of await navigator.clipboard.read()) {
+        const type = item.types.find((t) => t.startsWith("image/"));
+        if (type) return setFrame(which, await item.getType(type));
+      }
+      showStatus("The clipboard has no image in it.", { error: true });
+    } catch (e) {
+      showStatus(e.name === "NotAllowedError" ? "Clipboard access was blocked; allow it, or use ⌘V / choose a file." : e.message, { error: true });
+    }
+  }
+
   function setupFrame(which, box, input) {
-    box.onclick = (e) => { if (!e.target.classList.contains("x")) input.click(); };
+    slots[which] = { box, input };
+    emptySlot(which);
+    box.onclick = (e) => { lastSlot = which; if (!e.target.closest(".x, .paste")) input.click(); };
     box.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } };
-    input.onchange = async () => {
-      const file = input.files[0]; input.value = "";
-      if (!file) return;
-      frames[which] = await shrink(file, 2048);
-      box.innerHTML = `<img alt=""><button class="x small" type="button" aria-label="Remove">×</button>`;
-      box.querySelector("img").src = frames[which];
-      box.querySelector(".x").onclick = (e) => { e.stopPropagation(); frames[which] = null; box.textContent = which === "first" ? "First frame" : "Last frame"; };
+    box.onfocus = () => { lastSlot = which; };
+    input.onchange = () => { const file = input.files[0]; input.value = ""; if (file) setFrame(which, file); };
+    // drag and drop
+    box.ondragover = (e) => { e.preventDefault(); box.classList.add("over"); };
+    box.ondragleave = () => box.classList.remove("over");
+    box.ondrop = (e) => {
+      e.preventDefault(); box.classList.remove("over");
+      const file = [...(e.dataTransfer.files || [])].find((f) => f.type.startsWith("image/"));
+      if (file) { lastSlot = which; setFrame(which, file); }
     };
   }
+
+  // ⌘V / Ctrl+V anywhere outside a text field: into the slot touched last if it's empty, else the first empty one.
+  document.addEventListener("paste", (e) => {
+    const t = e.target;
+    if (t && (t.tagName === "TEXTAREA" || (t.tagName === "INPUT" && !["checkbox", "range", "file"].includes(t.type)))) return;
+    const item = [...(e.clipboardData ? e.clipboardData.items : [])].find((i) => i.type.startsWith("image/"));
+    if (!item) return;
+    e.preventDefault();
+    const which = !frames[lastSlot] ? lastSlot : !frames.first ? "first" : !frames.last ? "last" : lastSlot;
+    setFrame(which, item.getAsFile());
+  });
+
   function shrink(file, max) {
     return new Promise((resolve, reject) => {
       const img = new Image(), url = URL.createObjectURL(file);
