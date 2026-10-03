@@ -182,7 +182,7 @@ input[type], select, textarea { font-size: 16px; }
         </select>
         <button class="stop hidden" id="stopBtn">Stop</button>
       </div>
-      <p class="hint" id="costHint">Billed only while a worker runs: generation, plus 5 minutes idle after the last job.</p>
+      <p class="hint" id="costHint">Billed only while a worker runs: generation, plus 2 minutes idle after the last job.</p>
     </div>
   </section>
 
@@ -524,7 +524,7 @@ input[type], select, textarea { font-size: 16px; }
       const out = await runJob("warmup", { action: "warmup" });
       if (!out) return;
       if (out.config) { store.set("serverConfig", out.config); applyServerConfig(out.config); fillSelects(); }
-      showStatus("Worker ready. It stays up 5 minutes after the last job.", { progress: 1 });
+      showStatus("Worker ready. It stays up 2 minutes after the last job.", { progress: 1 });
     } catch (e) { showStatus(e.message, { error: true }); }
   };
 
