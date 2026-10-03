@@ -106,6 +106,7 @@ button.full { width: 100%; }
 .item .order { position: absolute; top: 6px; left: 6px; background: var(--accent); color: var(--accent-text); border-radius: 999px;
                min-width: 24px; height: 24px; display: grid; place-items: center; font-weight: 700; font-size: 13px; }
 .frame .chip { padding: 8px; line-height: 1.35; color: var(--text); }
+.frame .chip.over-img { position: absolute; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,.6); color: #fff; font-size: 12px; padding: 4px 8px; text-align: left; }
 .batch li.active { color: var(--text); }
 .batch li.bad { color: var(--err); }
 .report { color: var(--mute); font-size: 13px; margin-top: 10px; overflow-wrap: anywhere; }
@@ -339,11 +340,14 @@ input[type], select, textarea { font-size: 16px; }
 
   let startJob = null;          // { id, label }: start from the last frame of a job that hasn't finished yet
   let continueFrom = null;      // job id of a finished clip that "Continue" took its last frame from
-  function setStartJob(job) {
+  function setStartJob(job, preview = null) {
     const { box } = slots.first;
     frames.first = null; startJob = job;
-    box.innerHTML = `<span class="chip">↳ after:<br><b></b><br><small>its last frame, once it's done</small></span>` +
+    box.innerHTML = (preview ? `<img alt="">` : "") +
+                    `<span class="chip${preview ? " over-img" : ""}">↳ ${job.done ? "last frame of" : "after"}:<br><b></b>` +
+                    `${job.done ? "" : "<br><small>its last frame, once it's done</small>"}</span>` +
                     `<button class="x small" type="button" aria-label="Remove">×</button>`;
+    if (preview) box.querySelector("img").src = preview;
     box.querySelector("b").textContent = job.label;
     box.querySelector(".x").onclick = (e) => { e.stopPropagation(); emptySlot("first"); };
   }
@@ -766,7 +770,18 @@ input[type], select, textarea { font-size: 16px; }
       v.onloadedmetadata = async () => {
         try { await v.play(); v.pause(); } catch {}
         const t = where === "first" ? 0.001 : where === "last" ? Math.max(0, v.duration - 1 / 48) : Math.min(where, v.duration);
-        v.onseeked = () => (v.readyState >= 2 ? draw() : (v.onloadeddata = draw));
+        // Safari can hand back the previously shown frame if it's drawn right at "seeked"; wait until the
+        // seeked frame has been presented (requestVideoFrameCallback), with a short timeout as a fallback.
+        const presented = () => new Promise((r) => {
+          let fired = false;
+          if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(() => { fired = true; r(); });
+          setTimeout(() => { if (!fired) r(); }, v.requestVideoFrameCallback ? 400 : 200);
+        });
+        v.onseeked = async () => {
+          if (v.readyState < 2) await new Promise((r) => (v.onloadeddata = r));
+          await presented();
+          draw();
+        };
         v.currentTime = t;
       };
       v.onerror = () => done(reject, new Error("This video couldn't be decoded here."));
@@ -823,7 +838,14 @@ input[type], select, textarea { font-size: 16px; }
       cont.onclick = async () => {
         cont.disabled = true;
         try {
-          await setFrame("first", await canvasBlob(await grabFrame(entry.blob, "last")));
+          const stored = entry.jobId && Date.now() - new Date(entry.created).getTime() < 6 * 86400e3;
+          if (stored) {
+            let preview = null;
+            try { preview = (await grabFrame(entry.blob, "last", 480)).toDataURL("image/jpeg", 0.85); } catch {}
+            setStartJob({ id: entry.jobId, label: entry.prompt, done: true }, preview);
+          } else {
+            await setFrame("first", await canvasBlob(await grabFrame(entry.blob, "last")));
+          }
           emptySlot("last");
           if (entry.canvas && [...canvasSel.options].some((o) => o.value === entry.canvas)) { canvasSel.value = entry.canvas; store.set("canvas", entry.canvas); }
           continueFrom = entry.jobId || null;
