@@ -127,6 +127,12 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
 dialog h3 { margin: 0 0 4px; font-size: 17px; }
 .check { display: flex; gap: 8px; align-items: center; margin-top: 12px; font-size: 13px; color: var(--mute); }
 .hidden { display: none !important; }
+.lock { position: fixed; inset: 0; z-index: 1000; background: var(--bg); display: grid; place-items: center;
+        padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom)); }
+.lock-card { width: min(340px, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 22px; box-shadow: var(--shadow); text-align: center; }
+.lock-card h3 { margin: 0 0 4px; font-size: 18px; }
+.lock-card input { text-align: center; letter-spacing: .3em; font-size: 22px !important; margin-top: 10px; }
+.lock-card .error { min-height: 1.2em; margin: 8px 0 0; }
 /* Last, so it wins over `font: inherit`: iOS Safari zooms into any field with text under 16px. */
 input[type], select, textarea { font-size: 16px; }
 </style>
@@ -139,6 +145,7 @@ input[type], select, textarea { font-size: 16px; }
   <span class="pill" id="workerPill" title="RunPod worker state (checking it does not wake or bill the worker)"><span class="dot" id="workerDot"></span><span id="workerText">Checking…</span></span>
   <button class="small" id="wakeBtn" title="Start a worker and load the model now, so your first generation starts immediately">Start worker</button>
   <button class="small" id="settingsBtn" aria-label="Settings">Settings</button>
+  <button class="small" id="lockBtn" aria-label="Lock">Lock</button>
 </header>
 
 <main>
@@ -221,6 +228,18 @@ input[type], select, textarea { font-size: 16px; }
   </section>
 </main>
 
+<div id="lock" class="lock" role="dialog" aria-modal="true" aria-labelledby="lockTitle">
+  <form id="lockForm" class="lock-card" autocomplete="off">
+    <h3 id="lockTitle">H3 Studio is locked</h3>
+    <p class="hint" id="lockHint">Enter your PIN.</p>
+    <input type="password" id="pinInput" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="PIN" aria-label="PIN" required>
+    <input type="password" id="pinConfirm" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="Repeat PIN" aria-label="Repeat PIN" class="hidden">
+    <p class="hint error" id="lockError"></p>
+    <button class="primary full" id="lockSubmit">Unlock</button>
+    <button type="button" class="small" id="pinForgot" style="margin-top:14px">Forgot PIN</button>
+  </form>
+</div>
+
 <dialog id="settings">
   <form method="dialog" id="settingsForm">
     <h3>Connect to RunPod</h3>
@@ -271,7 +290,7 @@ input[type], select, textarea { font-size: 16px; }
     set(k, v) { try { localStorage.setItem("h3studio." + k, JSON.stringify(v)); } catch {} },
     del(k) { try { localStorage.removeItem("h3studio." + k); } catch {} },
   };
-  let cfg = store.get("cfg", null) || { endpoint: "", runpodKey: "", h3Key: "" };
+  let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
   const api = async (method, path, body) => {
@@ -729,8 +748,6 @@ input[type], select, textarea { font-size: 16px; }
     if (old && old.jobs) { for (const j of old.jobs) queue.push({ id: j.id, kind: "generate", label: (j.input && j.input.prompt || "").slice(0, 70), seed: j.seed, input: j.input || {}, state: "IN_QUEUE", text: "Reconnecting…", done: false, t: old.started });
                            store.del("batch"); saveQueue(); } }
   store.del("currentJob");
-  renderQueue();
-  if (connected()) ensurePolling();
 
   // ---------------------------------------------------------------- results + history (IndexedDB, optional)
   async function showResult(out, input) {
@@ -971,7 +988,6 @@ input[type], select, textarea { font-size: 16px; }
       thumbing = false;
     }
   }
-  renderHistory();
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch {}
 
   // ---------------------------------------------------------------- settings
@@ -985,12 +1001,118 @@ input[type], select, textarea { font-size: 16px; }
   $("settingsForm").onsubmit = () => {
     cfg = { endpoint: $("cfgEndpoint").value.trim(), runpodKey: $("cfgRunpod").value.trim(), h3Key: $("cfgH3").value.trim(),
             civitaiToken: $("cfgCivitai").value.trim() };
-    if ($("cfgRemember").checked) store.set("cfg", cfg); else store.del("cfg");
+    if ($("cfgRemember").checked) sealCfg(); else store.del("cfgSealed");
     pollHealth();
   };
-  $("forgetBtn").onclick = () => { store.del("cfg"); cfg = { endpoint: "", runpodKey: "", h3Key: "" }; dlg.close(); setPill("", "Not connected"); };
+  $("forgetBtn").onclick = () => { store.del("cfgSealed"); store.del("cfg"); cfg = { endpoint: "", runpodKey: "", h3Key: "" }; dlg.close(); setPill("", "Not connected"); };
 
-  if (!connected()) openSettings(); else pollHealth();
+  // ---------------------------------------------------------------- PIN lock
+  // The PIN never leaves this device and isn't stored: PBKDF2 turns it into an AES key that encrypts the saved
+  // settings (RunPod key, H3 key, Civitai token), plus a separate check value to recognise the right PIN.
+  // A 4-digit PIN keeps out someone holding your phone, not someone with a copy of its browser storage.
+  const PIN_ITER = 310000, AUTO_LOCK_MS = 5 * 60e3;
+  const te = new TextEncoder(), td = new TextDecoder();
+  const b64 = (u8) => btoa(String.fromCharCode(...u8));
+  const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+  let pinKey = null, hiddenAt = 0;
+
+  async function derive(pin, salt) {
+    const base = await crypto.subtle.importKey("raw", te.encode(pin), "PBKDF2", false, ["deriveBits"]);
+    const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: PIN_ITER }, base, 512));
+    return { key: await crypto.subtle.importKey("raw", bits.slice(0, 32), "AES-GCM", false, ["encrypt", "decrypt"]), check: b64(bits.slice(32)) };
+  }
+  async function sealCfg() {
+    if (!pinKey) return;
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, pinKey, te.encode(JSON.stringify(cfg))));
+    store.set("cfgSealed", { iv: b64(iv), ct: b64(ct) });
+    store.del("cfg");                                          // never keep a plaintext copy
+  }
+  async function openCfg() {
+    const sealed = store.get("cfgSealed", null);
+    if (sealed) cfg = JSON.parse(td.decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(sealed.iv) }, pinKey, unb64(sealed.ct))));
+    else {                                                     // settings saved before the PIN existed: adopt and seal them
+      const plain = store.get("cfg", null);
+      if (plain) { cfg = plain; await sealCfg(); }
+    }
+  }
+
+  const lockEl = $("lock"), pinInput = $("pinInput"), pinConfirm = $("pinConfirm");
+  function showLock(mode) {
+    lockEl.dataset.mode = mode;
+    lockEl.classList.remove("hidden");
+    const setup = mode === "setup";
+    $("lockTitle").textContent = setup ? "Set a PIN" : "H3 Studio is locked";
+    $("lockHint").textContent = setup ? "Choose a PIN (4+ digits). You'll need it every time the app opens. It isn't stored anywhere."
+                                      : "Enter your PIN.";
+    pinConfirm.classList.toggle("hidden", !setup); pinConfirm.required = setup;
+    $("lockSubmit").textContent = setup ? "Set PIN" : "Unlock";
+    $("pinForgot").classList.toggle("hidden", setup);
+    $("lockError").textContent = ""; pinInput.value = ""; pinConfirm.value = "";
+    setTimeout(() => pinInput.focus(), 50);
+  }
+  function lockNow() {
+    pinKey = null; cfg = { endpoint: "", runpodKey: "", h3Key: "" };
+    $("stage").innerHTML = '<div class="empty">Your video will appear here.</div>';
+    $("resultActions").classList.add("hidden"); $("report").textContent = ""; $("history").innerHTML = ""; $("batch").innerHTML = "";
+    if (dlg.open) dlg.close();
+    showLock(store.get("pin", null) ? "unlock" : "setup");
+  }
+  function unlocked() {
+    lockEl.classList.add("hidden");
+    renderHistory(); renderQueue();
+    if (!connected()) openSettings(); else { pollHealth(); ensurePolling(); }
+  }
+
+  $("lockForm").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const pin = pinInput.value.trim(), err = $("lockError");
+    if (!/^\d{4,12}$/.test(pin)) { err.textContent = "Use 4 to 12 digits."; return; }
+    const btn = $("lockSubmit"); btn.disabled = true;
+    try {
+      if (lockEl.dataset.mode === "setup") {
+        if (pin !== pinConfirm.value.trim()) { err.textContent = "The two PINs don't match."; return; }
+        const salt = crypto.getRandomValues(new Uint8Array(16));
+        const { key, check } = await derive(pin, salt);
+        store.set("pin", { salt: b64(salt), check, iter: PIN_ITER });
+        pinKey = key; await openCfg();
+        unlocked();
+        return;
+      }
+      const rec = store.get("pin", null), fails = store.get("pinFails", { n: 0, until: 0 });
+      if (Date.now() < fails.until) { err.textContent = `Too many tries. Wait ${Math.ceil((fails.until - Date.now()) / 1000)} s.`; return; }
+      const { key, check } = await derive(pin, unb64(rec.salt));
+      if (check !== rec.check) {
+        const n = fails.n + 1;
+        store.set("pinFails", { n, until: n >= 5 ? Date.now() + 30e3 * 2 ** (n - 5) : 0 });
+        err.textContent = n >= 5 ? `Wrong PIN. Locked for ${30 * 2 ** (n - 5)} s.` : "Wrong PIN.";
+        pinInput.value = ""; pinInput.focus();
+        return;
+      }
+      store.del("pinFails");
+      pinKey = key;
+      try { await openCfg(); } catch { cfg = { endpoint: "", runpodKey: "", h3Key: "" }; }
+      unlocked();
+    } finally { btn.disabled = false; }
+  };
+  $("pinForgot").onclick = async () => {
+    if (!confirm("Reset the PIN? This deletes the saved keys AND the video History on this device, so the lock can't be bypassed. You'll set a new PIN and re-enter your keys.")) return;
+    for (const k of ["pin", "pinFails", "cfgSealed", "cfg", "queue"]) store.del(k);
+    try { const all = await db.all(); for (const e of all) await db.del(e.id); } catch {}
+    lockNow();
+  };
+  $("lockBtn").onclick = lockNow;
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) hiddenAt = Date.now();
+    else if (pinKey && hiddenAt && Date.now() - hiddenAt > AUTO_LOCK_MS) lockNow();
+  });
+
+  if (!window.crypto || !crypto.subtle) {
+    $("lockTitle").textContent = "Can't lock here"; $("lockHint").textContent = "This browser has no secure crypto on this address; open the https:// page.";
+    $("lockForm").querySelectorAll("input,button").forEach((e) => (e.disabled = true));
+  } else {
+    showLock(store.get("pin", null) ? "unlock" : "setup");
+  }
 })();
 </script>
 </body>
