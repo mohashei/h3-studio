@@ -103,8 +103,10 @@ button.full { width: 100%; }
 .report { color: var(--mute); font-size: 13px; margin-top: 10px; overflow-wrap: anywhere; }
 .error { color: var(--err); }
 .result-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-.frame-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; width: 100%; margin-top: 2px; }
-.frame-actions span { color: var(--mute); font-size: 13px; margin-right: 2px; }
+.frame-actions { width: 100%; margin-top: 2px; font-size: 13px; color: var(--mute); }
+.frame-actions summary { cursor: pointer; padding: 4px 0; }
+.frame-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+button.small.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; font-weight: 600; }
 a.button { display: inline-block; text-decoration: none; color: var(--text); background: var(--sunken); border: 1px solid var(--line); border-radius: 9px; padding: 5px 10px; font-size: 13px; }
 .history { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
 .item { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--sunken); cursor: pointer; }
@@ -335,7 +337,7 @@ input[type], select, textarea { font-size: 16px; }
     catch (e) { showStatus(e.message, { error: true }); return; }
     box.innerHTML = `<img alt=""><button class="x small" type="button" aria-label="Remove">×</button>`;
     box.querySelector("img").src = frames[which];
-    box.querySelector(".x").onclick = (e) => { e.stopPropagation(); emptySlot(which); };
+    box.querySelector(".x").onclick = (e) => { e.stopPropagation(); emptySlot(which); if (which === "first") continueFrom = null; };
   }
 
   // Async clipboard (Paste button): Safari asks with its own "Paste" bubble; Chrome may ask for permission.
@@ -529,6 +531,7 @@ input[type], select, textarea { font-size: 16px; }
   // A "batch" is 1..8 generate jobs, each with its own seed. RunPod queues them; the worker runs them one
   // after another (the Space caches the prompt encoding between them). Each result lands in History as it finishes.
   let batch = null;
+  let continueFrom = null;     // id of the clip a "Continue" started from; saved on the next results
 
   $("generateBtn").onclick = async () => {
     if (!connected()) { openSettings(); return; }
@@ -553,9 +556,11 @@ input[type], select, textarea { font-size: 16px; }
         const input = { ...base, seed: sd };
         const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } });
         const { image, last_image, ...meta } = input;          // keep localStorage small
+        if (continueFrom) meta.parent = continueFrom;
         batch.jobs.push({ id: job.id, seed: sd, input: meta, state: "IN_QUEUE", text: "Queued", done: false });
       }
       saveBatch();
+      continueFrom = null;
       await pollBatch(batch);
     } catch (e) {
       showStatus(e.message, { error: true });
@@ -658,7 +663,7 @@ input[type], select, textarea { font-size: 16px; }
     const entry = { id: Date.now(), created: new Date().toISOString(), prompt: input.prompt || "(resumed job)",
                     preset: input.preset || "", canvas: input.canvas || "", duration: input.duration, seed: out.seed ?? input.seed,
                     lora: input.lora ? { link: loraUrl.value.trim(), strength: input.lora.strength, steps: input.lora.steps } : null,
-                    report: out.report || "", blob, url: out.video_url || null };
+                    report: out.report || "", blob, url: out.video_url || null, parent: input.parent || null };
     if (blob) entry.thumb = await makeThumb(blob);
     play(entry);
     if (blob) { await db.put(entry); renderHistory(); }
@@ -732,8 +737,28 @@ input[type], select, textarea { font-size: 16px; }
     };
     acts.append(reuse);
     if (entry.blob) {
-      const frameRow = document.createElement("div"); frameRow.className = "frame-actions";
-      frameRow.append(Object.assign(document.createElement("span"), { textContent: "Use a frame as keyframe:" }));
+      // The common case: the next clip starts where this one ends, with a new prompt for what happens next.
+      const cont = document.createElement("button"); cont.className = "small primary"; cont.textContent = "Continue from last frame";
+      cont.title = "Start the next video from this one's last frame; then write what happens next";
+      cont.onclick = async () => {
+        cont.disabled = true;
+        try {
+          await setFrame("first", await canvasBlob(await grabFrame(entry.blob, "last")));
+          emptySlot("last");
+          if (entry.canvas && [...canvasSel.options].some((o) => o.value === entry.canvas)) { canvasSel.value = entry.canvas; store.set("canvas", entry.canvas); }
+          continueFrom = entry.id || null;
+          const box = $("prompt");
+          box.scrollIntoView({ behavior: "smooth", block: "center" });
+          box.focus({ preventScroll: true }); box.setSelectionRange(box.value.length, box.value.length);
+          showStatus("Start frame set from the last frame. Now describe what happens next, then Generate.", { progress: 1 });
+        } catch (e) { showStatus(e.message, { error: true }); }
+        finally { cont.disabled = false; }
+      };
+      acts.prepend(cont);
+      const more = document.createElement("details"); more.className = "frame-actions";
+      more.append(Object.assign(document.createElement("summary"), { textContent: "More frame options" }));
+      const frameRow = document.createElement("div"); frameRow.className = "frame-row";
+      more.append(frameRow);
       for (const [from, to, label] of [["last", "first", "Last → Start"], ["first", "first", "First → Start"],
                                        ["first", "last", "First → End"], ["last", "last", "Last → End"]]) {
         const b = document.createElement("button"); b.className = "small"; b.textContent = label;
@@ -749,7 +774,7 @@ input[type], select, textarea { font-size: 16px; }
         };
         frameRow.append(b);
       }
-      acts.append(frameRow);
+      acts.append(more);
     }
     if (entry.id && entry.blob) {
       const del = document.createElement("button"); del.className = "small"; del.textContent = "Delete";
