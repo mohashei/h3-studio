@@ -96,8 +96,16 @@ button.full { width: 100%; }
 .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .4s ease; }
 .bar.indeterminate > div { width: 30%; animation: slide 1.4s ease-in-out infinite; }
 @keyframes slide { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
-.batch { margin: 10px 0 0; padding-left: 22px; font-size: 13px; color: var(--mute); }
-.batch li { margin: 2px 0; overflow-wrap: anywhere; }
+.queue { margin-top: 12px; }
+.batch { margin: 6px 0 0; padding-left: 22px; font-size: 13px; color: var(--mute); }
+.batch li { margin: 4px 0; overflow-wrap: anywhere; }
+.batch li .qa { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: middle; flex-wrap: wrap; }
+.batch li .qa button { padding: 2px 8px; font-size: 12px; }
+.item { position: relative; }
+.item.sel { outline: 3px solid var(--accent); outline-offset: -3px; }
+.item .order { position: absolute; top: 6px; left: 6px; background: var(--accent); color: var(--accent-text); border-radius: 999px;
+               min-width: 24px; height: 24px; display: grid; place-items: center; font-weight: 700; font-size: 13px; }
+.frame .chip { padding: 8px; line-height: 1.35; color: var(--text); }
 .batch li.active { color: var(--text); }
 .batch li.bad { color: var(--err); }
 .report { color: var(--mute); font-size: 13px; margin-top: 10px; overflow-wrap: anywhere; }
@@ -180,7 +188,7 @@ input[type], select, textarea { font-size: 16px; }
           <option value="1">×1</option><option value="2">×2</option><option value="3">×3</option><option value="4">×4</option>
           <option value="6">×6</option><option value="8">×8</option>
         </select>
-        <button class="stop hidden" id="stopBtn">Stop</button>
+        <button class="stop hidden" id="stopBtn" title="Cancel everything that hasn't finished">Stop all</button>
       </div>
       <p class="hint" id="costHint">Billed only while a worker runs: generation, plus 2 minutes idle after the last job.</p>
     </div>
@@ -193,13 +201,19 @@ input[type], select, textarea { font-size: 16px; }
         <div class="line"><span class="msg" id="statusMsg"></span><span class="time" id="statusTime"></span></div>
         <div class="bar" id="bar"><div></div></div>
       </div>
-      <ol class="batch hidden" id="batch"></ol>
+      <div class="queue hidden" id="queueBox">
+        <div class="row"><b style="font-size:13px">Queue</b><span class="spacer"></span><button class="small" id="clearDone">Clear finished</button></div>
+        <ol class="batch" id="batch"></ol>
+      </div>
       <div class="result-actions hidden" id="resultActions"></div>
       <div class="report" id="report"></div>
     </div>
 
     <div class="card">
-      <div class="row" style="margin-bottom:10px"><h2 style="margin:0">History</h2><span class="spacer"></span><span class="hint" style="margin:0">Saved in this browser</span></div>
+      <div class="row" style="margin-bottom:10px"><h2 style="margin:0">History</h2><span class="spacer"></span>
+        <button class="small" id="selectBtn" title="Pick clips in order and join them into one video">Select to join</button></div>
+      <div class="row hidden" id="joinBar" style="margin-bottom:10px"><span class="hint" style="margin:0" id="joinHint">Tap clips in the order you want them.</span>
+        <span class="spacer"></span><button class="small primary" id="joinSelected" disabled>Join</button><button class="small" id="joinCancel">Cancel</button></div>
       <div class="history" id="history"></div>
       <p class="hint" id="historyEmpty">Finished videos are kept here, so they stay playable after the worker shuts down.</p>
     </div>
@@ -323,9 +337,20 @@ input[type], select, textarea { font-size: 16px; }
   let lastSlot = "first";                                 // the slot you touched last gets a ⌘V paste
   const LABEL = { first: "First frame", last: "Last frame" };
 
+  let startJob = null;          // { id, label }: start from the last frame of a job that hasn't finished yet
+  let continueFrom = null;      // job id of a finished clip that "Continue" took its last frame from
+  function setStartJob(job) {
+    const { box } = slots.first;
+    frames.first = null; startJob = job;
+    box.innerHTML = `<span class="chip">↳ after:<br><b></b><br><small>its last frame, once it's done</small></span>` +
+                    `<button class="x small" type="button" aria-label="Remove">×</button>`;
+    box.querySelector("b").textContent = job.label;
+    box.querySelector(".x").onclick = (e) => { e.stopPropagation(); emptySlot("first"); };
+  }
   function emptySlot(which) {
     const { box } = slots[which];
     frames[which] = null;
+    if (which === "first") { startJob = null; continueFrom = null; }
     box.innerHTML = `<span>${LABEL[which]}<br><small>tap to choose · drop · paste</small></span>` +
                     `<button class="paste small" type="button" aria-label="Paste ${LABEL[which].toLowerCase()} from clipboard">Paste</button>`;
     box.querySelector(".paste").onclick = (e) => { e.stopPropagation(); lastSlot = which; pasteFromClipboard(which); };
@@ -333,11 +358,12 @@ input[type], select, textarea { font-size: 16px; }
 
   async function setFrame(which, blob) {
     const { box } = slots[which];
+    if (which === "first") startJob = null;
     try { frames[which] = await shrink(blob, 2048); }
     catch (e) { showStatus(e.message, { error: true }); return; }
     box.innerHTML = `<img alt=""><button class="x small" type="button" aria-label="Remove">×</button>`;
     box.querySelector("img").src = frames[which];
-    box.querySelector(".x").onclick = (e) => { e.stopPropagation(); emptySlot(which); if (which === "first") continueFrom = null; };
+    box.querySelector(".x").onclick = (e) => { e.stopPropagation(); emptySlot(which); };
   }
 
   // Async clipboard (Paste button): Safari asks with its own "Paste" bubble; Chrome may ask for permission.
@@ -468,10 +494,7 @@ input[type], select, textarea { font-size: 16px; }
   setInterval(() => { if (current) $("statusTime").textContent = fmtTime((Date.now() - current.started) / 1000); }, 500);
   const fmtTime = (s) => s < 60 ? `${Math.floor(s)}s` : `${Math.floor(s / 60)}m ${String(Math.floor(s % 60)).padStart(2, "0")}s`;
 
-  function setBusy(busy, kind) {
-    $("generateBtn").disabled = busy; $("wakeBtn").disabled = busy;
-    $("stopBtn").classList.toggle("hidden", !(busy && kind === "generate"));
-  }
+  function setBusy(busy) { $("wakeBtn").disabled = busy; }
 
   async function runJob(kind, input) {
     if (!connected()) { openSettings(); return null; }
@@ -528,10 +551,23 @@ input[type], select, textarea { font-size: 16px; }
     } catch (e) { showStatus(e.message, { error: true }); }
   };
 
-  // A "batch" is 1..8 generate jobs, each with its own seed. RunPod queues them; the worker runs them one
-  // after another (the Space caches the prompt encoding between them). Each result lands in History as it finishes.
-  let batch = null;
-  let continueFrom = null;     // id of the clip a "Continue" started from; saved on the next results
+  // The queue: every generation and join sent from this page. They all go to RunPod right away; RunPod queues
+  // them and the worker works through them in order (continuations and joins wait for the jobs they need).
+  // Generate stays available, so you can keep adding work. Persisted, so a reload reconnects.
+  let queue = (store.get("queue", []) || []).filter((j) => !j.done || Date.now() - (j.t || 0) < 6 * 3600e3);
+  let polling = false;
+  const active = () => queue.filter((j) => !j.done);
+  function saveQueue() { store.set("queue", queue.slice(-40).map(({ id, kind, label, seed, input, state, text, done, bad, t }) =>
+                                                         ({ id, kind, label, seed, input, state, text, done, bad, t }))); }
+
+  async function submit(kind, input, label, seedValue) {
+    const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } });
+    const { image, last_image, clips, ...meta } = input;                    // keep localStorage small
+    if (clips) meta.clips = clips.map(({ b64, ...c }) => c);
+    queue.push({ id: job.id, kind, label, seed: seedValue, input: meta, state: "IN_QUEUE", text: "Queued", done: false, t: Date.now() });
+    saveQueue(); renderQueue(); ensurePolling();
+    return job.id;
+  }
 
   $("generateBtn").onclick = async () => {
     if (!connected()) { openSettings(); return; }
@@ -539,7 +575,10 @@ input[type], select, textarea { font-size: 16px; }
     if (!prompt) { $("prompt").focus(); showStatus("Write a prompt first.", { error: true }); return; }
     const base = { action: "generate", prompt, preset: presetSel.value, canvas: canvasSel.value, duration: Number(duration.value) };
     if (frames.first) base.image = frames.first;
+    else if (startJob) base.start_from = { job: startJob.id };
     if (frames.last) base.last_image = frames.last;
+    const parent = startJob ? startJob.id : continueFrom;
+    if (parent) base.parent = parent;
     if (loraUrl.value.trim()) {
       try { base.lora = { url: downloadUrl(loraUrl.value), strength: Number(loraStrength.value), steps: Number(loraSteps.value) || 8 }; }
       catch (e) { showStatus(e.message, { error: true }); loraUrl.focus(); return; }
@@ -548,107 +587,146 @@ input[type], select, textarea { font-size: 16px; }
     const first = seedRandom.checked ? randomSeed() : (Number(seed.value) || 0);
     const seeds = Array.from({ length: n }, (_, i) => seedRandom.checked ? (i ? randomSeed() : first) : first + i);
     seed.value = seeds[0]; store.set("seed", seed.value);
-
-    batch = current = { kind: "generate", started: Date.now(), stopping: false, jobs: [] };
-    setBusy(true, "generate"); showStatus(n > 1 ? `Sending ${n} jobs…` : "Sending…");
+    const btn = $("generateBtn"); btn.disabled = true;
     try {
-      for (const sd of seeds) {
-        const input = { ...base, seed: sd };
-        const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } });
-        const { image, last_image, ...meta } = input;          // keep localStorage small
-        if (continueFrom) meta.parent = continueFrom;
-        batch.jobs.push({ id: job.id, seed: sd, input: meta, state: "IN_QUEUE", text: "Queued", done: false });
-      }
-      saveBatch();
-      continueFrom = null;
-      await pollBatch(batch);
-    } catch (e) {
-      showStatus(e.message, { error: true });
-      if (batch && batch.jobs.length) await pollBatch(batch).catch(() => {});
-    } finally {
-      finishBatch();
-    }
+      for (const sd of seeds) await submit("generate", { ...base, seed: sd }, prompt.slice(0, 70), sd);
+      if (startJob || continueFrom) emptySlot("first");                    // a continuation is used once
+      showStatus(n > 1 ? `Queued ${n} videos.` : "Queued.");
+    } catch (e) { showStatus(e.message, { error: true }); }
+    finally { btn.disabled = false; }
   };
 
-  function saveBatch() { if (batch) store.set("batch", { started: batch.started, jobs: batch.jobs.map(({ id, seed, input }) => ({ id, seed, input })) }); }
-  function finishBatch() { batch = current = null; store.del("batch"); store.del("currentJob"); setBusy(false); pollHealth(); }
+  // Clips that lead up to `id` through Continue links, oldest first (queued jobs and History both count).
+  async function chainTo(id) {
+    const hist = await db.all(), byJob = new Map();
+    for (const e of hist) if (e.jobId) byJob.set(e.jobId, { id: e.jobId, parent: e.parentJob, entry: e, label: e.prompt });
+    for (const j of queue) if (j.kind === "generate" && !byJob.has(j.id)) byJob.set(j.id, { id: j.id, parent: j.input.parent, job: j, label: j.label });
+    const chain = [];
+    for (let cur = byJob.get(id); cur && chain.length < 24; cur = cur.parent ? byJob.get(cur.parent) : null) chain.unshift(cur);
+    return chain;
+  }
 
-  async function pollBatch(b) {
+  // A clip reference the worker understands: by job id (waited for if still running, else read from its store),
+  // or the video itself for clips the worker no longer keeps (older than ~a week, or from before job ids were saved).
+  async function clipRef(node, prev) {
+    const trim_first = !!(prev && node.parent && node.parent === prev.id);   // a continuation repeats the previous last frame
+    const e = node.entry;
+    if (node.job && !node.job.done) return { job: node.id, wait: true, trim_first };
+    if (e && e.jobId && Date.now() - new Date(e.created).getTime() < 6 * 86400e3) return { job: e.jobId, wait: false, trim_first };
+    if (e && e.blob) return { b64: await blobB64(e.blob), trim_first };
+    throw new Error(`"${node.label}" isn't available to join any more.`);
+  }
+  const blobB64 = (b) => new Promise((res) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.readAsDataURL(b); });
+
+  async function queueJoin(nodes, why) {
+    if (nodes.length < 2) { showStatus("A join needs at least two clips.", { error: true }); return; }
+    try {
+      const clips = [];
+      for (let i = 0; i < nodes.length; i++) clips.push(await clipRef(nodes[i], nodes[i - 1]));
+      const size = clips.reduce((a, c) => a + (c.b64 ? c.b64.length : 0), 0);
+      if (size > 9e6) throw new Error("Too much video to upload in one join; join fewer older clips at a time.");
+      await submit("join", { action: "join", clips }, `Join ${nodes.length}: ${why}`.slice(0, 70));
+      showStatus(`Join of ${nodes.length} clips queued.`);
+    } catch (e) { showStatus(e.message, { error: true }); }
+  }
+  async function joinChain(id) {
+    const chain = await chainTo(id);
+    if (chain.length < 2) { showStatus("This clip doesn't continue from another one. Use Select to join in History instead.", { error: true }); return; }
+    queueJoin(chain, chain[chain.length - 1].label);
+  }
+
+  function ensurePolling() { if (!polling && active().length) pollQueue(); }
+  async function pollQueue() {
+    polling = true; current = current || { started: Date.now() };
     let delay = 1500;
-    while (b.jobs.some((j) => !j.done)) {
-      await Promise.all(b.jobs.filter((j) => !j.done).map(async (j) => {
-        let s;
-        try { s = await api("GET", `/status/${j.id}`); } catch (e) { j.text = e.message; return; }
-        j.state = s.status;
-        if (s.status === "IN_QUEUE") j.text = b.stopping ? "Cancelling…" : "Queued";
-        else if (s.status === "IN_PROGRESS") j.text = b.stopping ? "Stopping…" : (typeof s.output === "string" ? s.output : "Working…");
-        else if (s.status === "COMPLETED") {
-          j.done = true;
-          if (s.output && s.output.error) { j.bad = true; j.text = s.output.error; }
-          else { j.text = `Done in ${fmtTime((s.output && s.output.seconds) || 0)}`; await showResult(s.output || {}, { ...j.input, seed: j.seed }); }
-        } else {
-          j.done = true; j.bad = true;
-          j.text = s.status === "FAILED" ? parseError(s) : s.status === "CANCELLED" ? "Cancelled." : "Timed out on RunPod.";
-        }
-      }));
-      renderBatch(b);
-      if (b.jobs.some((j) => !j.done)) { await sleep(delay); delay = Math.min(delay + 250, 3000); }
+    try {
+      while (active().length) {
+        await Promise.all(active().map(async (j) => {
+          let s;
+          try { s = await api("GET", `/status/${j.id}`); } catch (e) { j.text = e.message; return; }
+          j.state = s.status;
+          if (s.status === "IN_QUEUE") j.text = j.stopping ? "Cancelling…" : "Queued";
+          else if (s.status === "IN_PROGRESS") j.text = j.stopping ? "Stopping…" : (typeof s.output === "string" ? s.output : "Working…");
+          else if (s.status === "COMPLETED") {
+            j.done = true;
+            if (s.output && s.output.error) { j.bad = true; j.text = s.output.error; }
+            else {
+              j.text = `Done in ${fmtTime((s.output && s.output.seconds) || 0)}`;
+              await showResult(s.output || {}, { ...j.input, seed: j.seed, jobId: j.id, kind: j.kind, label: j.label });
+            }
+          } else {
+            j.done = true; j.bad = true;
+            j.text = s.status === "FAILED" ? parseError(s) : s.status === "CANCELLED" ? "Cancelled." : "Timed out on RunPod.";
+          }
+        }));
+        saveQueue(); renderQueue();
+        if (active().length) { await sleep(delay); delay = Math.min(delay + 250, 3000); }
+      }
+    } finally {
+      polling = false; current = null; renderQueue(); pollHealth();
     }
   }
 
-  function renderBatch(b) {
-    const n = b.jobs.length, done = b.jobs.filter((j) => j.done && !j.bad).length;
-    const active = b.jobs.find((j) => j.state === "IN_PROGRESS" && /step \d+\/\d+/.test(j.text)) || b.jobs.find((j) => j.state === "IN_PROGRESS");
-    const list = $("batch");
-    list.classList.toggle("hidden", n < 2);
+  async function cancelJobs(jobs) {
+    // anything that continues from or joins a cancelled job can't run either
+    const ids = new Set(jobs.map((j) => j.id));
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const j of active()) {
+        const deps = [j.input.start_from && j.input.start_from.job, ...((j.input.clips || []).map((c) => c.job))].filter(Boolean);
+        if (!ids.has(j.id) && deps.some((d) => ids.has(d))) { ids.add(j.id); grew = true; }
+      }
+    }
+    const targets = active().filter((j) => ids.has(j.id));
+    targets.forEach((j) => { j.stopping = true; }); renderQueue();
+    await Promise.all(targets.filter((j) => j.state === "IN_QUEUE").map((j) => api("POST", `/cancel/${j.id}`).catch(() => {})));
+    const started = targets.filter((j) => j.state !== "IN_QUEUE").map((j) => j.id);
+    if (started.length) await api("POST", "/run", { input: { action: "cancel", job_ids: started, api_key: cfg.h3Key } }).catch((e) => showStatus("Stop failed: " + e.message, { error: true }));
+  }
+  $("stopBtn").onclick = () => cancelJobs(active());
+  $("clearDone").onclick = () => { queue = queue.filter((j) => !j.done); saveQueue(); renderQueue(); };
+
+  function renderQueue() {
+    const list = $("batch"), open = active();
+    $("queueBox").classList.toggle("hidden", queue.length === 0);
+    $("stopBtn").classList.toggle("hidden", open.length === 0);
     list.innerHTML = "";
-    for (const j of b.jobs) {
+    const running = open.find((j) => j.state === "IN_PROGRESS" && /step \d+\/\d+/.test(j.text)) || open.find((j) => j.state === "IN_PROGRESS");
+    for (const j of queue) {
       const li = document.createElement("li");
-      li.textContent = `seed ${j.seed} · ${j.text}`;
-      if (j === active) li.className = "active"; else if (j.bad) li.className = "bad";
+      li.append(document.createTextNode(`${j.label}${j.seed != null ? ` · seed ${j.seed}` : ""} — ${j.text}`));
+      if (j === running) li.className = "active"; else if (j.bad) li.className = "bad";
+      const qa = document.createElement("span"); qa.className = "qa";
+      const add = (text, title, fn) => { const b = document.createElement("button"); b.className = "small"; b.textContent = text; b.title = title; b.onclick = fn; qa.append(b); };
+      if (j.kind === "generate" && !j.bad) add("Continue after", "Start the next video from this one's last frame, once it's done", () => {
+        setStartJob({ id: j.id, label: j.label });
+        const box = $("prompt"); box.scrollIntoView({ behavior: "smooth", block: "center" }); box.focus({ preventScroll: true });
+        showStatus("The next video will start from that one's last frame. Describe what happens next, then Generate.", { progress: 1 });
+      });
+      if (j.kind === "generate" && !j.bad && j.input.parent) add("Join chain", "Join this clip with the clips it continues from", () => joinChain(j.id));
+      if (!j.done) add("×", "Cancel (and anything that depends on it)", () => cancelJobs([j]));
+      if (qa.childElementCount) li.append(qa);
       list.append(li);
     }
-    if (b.jobs.every((j) => j.done)) {
-      const bad = b.jobs.filter((j) => j.bad);
-      if (n === 1) showStatus(bad.length ? b.jobs[0].text : b.jobs[0].text + " on the GPU.", { error: bad.length > 0, progress: bad.length ? null : 1 });
-      else showStatus(`${done} of ${n} done${bad.length ? `, ${bad.length} stopped or failed` : ""}.`, { error: done === 0, progress: done ? 1 : null });
-      return;
-    }
-    if (active) {
-      const m = active.text.match(/step (\d+)\/(\d+)/);
-      const which = n > 1 ? `Video ${b.jobs.indexOf(active) + 1} of ${n}: ` : "";
-      showStatus(which + active.text, { progress: m ? Number(m[1]) / Number(m[2]) : null });
+    if (!open.length) return;
+    const queued = open.length - (running ? 1 : 0);
+    if (running) {
+      const m = running.text.match(/step (\d+)\/(\d+)/);
+      showStatus(`${running.label}: ${running.text}${queued ? ` · ${queued} more queued` : ""}`, { progress: m ? Number(m[1]) / Number(m[2]) : null });
     } else {
       const w = (health && health.workers) || {};
       const warm = (w.ready || 0) + (w.idle || 0) + (w.running || 0) > 0;
-      showStatus(b.stopping ? "Cancelling…" : warm ? (n > 1 ? `Queued (${done} of ${n} done)` : "Queued")
-                                                 : "Waking a GPU worker. A start from sleep takes a few minutes…");
+      showStatus(warm ? `${open.length} queued` : "Waking a GPU worker. A start from sleep takes a few minutes…");
     }
   }
 
-  $("stopBtn").onclick = async () => {
-    const b = batch;
-    if (!b || b.stopping) return;
-    b.stopping = true; $("stopBtn").disabled = true; renderBatch(b);
-    try {
-      const open = b.jobs.filter((j) => !j.done);
-      // Not started yet: RunPod drops them. Started (or waiting on the worker): the worker stops them at the next step.
-      await Promise.all(open.filter((j) => j.state === "IN_QUEUE").map((j) => api("POST", `/cancel/${j.id}`).catch(() => {})));
-      const started = open.filter((j) => j.state !== "IN_QUEUE").map((j) => j.id);
-      if (started.length) await api("POST", "/run", { input: { action: "cancel", job_ids: started, api_key: cfg.h3Key } });
-    } catch (e) { showStatus("Stop failed: " + e.message, { error: true }); b.stopping = false; }
-    finally { $("stopBtn").disabled = false; }
-  };
-
-  // Resume a batch that was running when the page was closed or reloaded.
-  store.del("currentJob");                         // single-job format from older versions of this page
-  const pending = store.get("batch", null);
-  if (pending && pending.jobs && pending.jobs.length && connected()) {
-    batch = current = { kind: "generate", started: pending.started, stopping: false,
-                        jobs: pending.jobs.map((j) => ({ ...j, state: "IN_QUEUE", text: "Reconnecting…", done: false })) };
-    setBusy(true, "generate"); showStatus("Reconnecting to your jobs…");
-    pollBatch(batch).catch((e) => showStatus(e.message, { error: true })).finally(finishBatch);
-  }
+  // Older versions of this page kept a single "batch"; carry it over.
+  { const old = store.get("batch", null);
+    if (old && old.jobs) { for (const j of old.jobs) queue.push({ id: j.id, kind: "generate", label: (j.input && j.input.prompt || "").slice(0, 70), seed: j.seed, input: j.input || {}, state: "IN_QUEUE", text: "Reconnecting…", done: false, t: old.started });
+                           store.del("batch"); saveQueue(); } }
+  store.del("currentJob");
+  renderQueue();
+  if (connected()) ensurePolling();
 
   // ---------------------------------------------------------------- results + history (IndexedDB, optional)
   async function showResult(out, input) {
@@ -660,10 +738,12 @@ input[type], select, textarea { font-size: 16px; }
     } else if (out.video_url) {
       try { blob = await (await fetch(out.video_url)).blob(); } catch { blob = null; }
     }
-    const entry = { id: Date.now(), created: new Date().toISOString(), prompt: input.prompt || "(resumed job)",
+    const entry = { id: Date.now(), created: new Date().toISOString(),
+                    prompt: input.kind === "join" ? (input.label || "Joined clips") : (input.prompt || "(resumed job)"),
+                    jobId: input.jobId || null, parentJob: input.parent || null, kind: input.kind || "generate",
                     preset: input.preset || "", canvas: input.canvas || "", duration: input.duration, seed: out.seed ?? input.seed,
                     lora: input.lora ? { link: loraUrl.value.trim(), strength: input.lora.strength, steps: input.lora.steps } : null,
-                    report: out.report || "", blob, url: out.video_url || null, parent: input.parent || null };
+                    report: out.report || "", blob, url: out.video_url || null };
     if (blob) entry.thumb = await makeThumb(blob);
     play(entry);
     if (blob) { await db.put(entry); renderHistory(); }
@@ -746,7 +826,7 @@ input[type], select, textarea { font-size: 16px; }
           await setFrame("first", await canvasBlob(await grabFrame(entry.blob, "last")));
           emptySlot("last");
           if (entry.canvas && [...canvasSel.options].some((o) => o.value === entry.canvas)) { canvasSel.value = entry.canvas; store.set("canvas", entry.canvas); }
-          continueFrom = entry.id || null;
+          continueFrom = entry.jobId || null;
           const box = $("prompt");
           box.scrollIntoView({ behavior: "smooth", block: "center" });
           box.focus({ preventScroll: true }); box.setSelectionRange(box.value.length, box.value.length);
@@ -755,6 +835,12 @@ input[type], select, textarea { font-size: 16px; }
         finally { cont.disabled = false; }
       };
       acts.prepend(cont);
+      if (entry.parentJob) {
+        const jc = document.createElement("button"); jc.className = "small"; jc.textContent = "Join chain";
+        jc.title = "Join this clip with the clips it continues from, in order";
+        jc.onclick = () => joinChain(entry.jobId);
+        cont.after(jc);
+      }
       const more = document.createElement("details"); more.className = "frame-actions";
       more.append(Object.assign(document.createElement("summary"), { textContent: "More frame options" }));
       const frameRow = document.createElement("div"); frameRow.className = "frame-row";
@@ -808,6 +894,28 @@ input[type], select, textarea { font-size: 16px; }
   })();
 
   let thumbing = false;
+  let selecting = false, selected = [];
+  function toggleSelect(e) {
+    const at = selected.findIndex((x) => x.id === e.id);
+    if (at >= 0) selected.splice(at, 1); else selected.push(e);
+    $("joinSelected").disabled = selected.length < 2;
+    $("joinSelected").textContent = selected.length >= 2 ? `Join ${selected.length}` : "Join";
+    renderHistory();
+  }
+  function setSelecting(on) {
+    selecting = on; selected = [];
+    $("joinBar").classList.toggle("hidden", !on); $("selectBtn").classList.toggle("hidden", on);
+    $("joinSelected").disabled = true; $("joinSelected").textContent = "Join";
+    renderHistory();
+  }
+  $("selectBtn").onclick = () => setSelecting(true);
+  $("joinCancel").onclick = () => setSelecting(false);
+  $("joinSelected").onclick = async () => {
+    const nodes = selected.map((e) => ({ id: e.jobId || `local-${e.id}`, parent: e.parentJob, entry: e, label: e.prompt }));
+    const label = selected.map((e) => e.prompt).join(" → ");
+    setSelecting(false);
+    await queueJoin(nodes, label);
+  };
   async function renderHistory() {
     const items = await db.all();
     const box = $("history"); box.innerHTML = "";
@@ -819,9 +927,11 @@ input[type], select, textarea { font-size: 16px; }
       if (e.thumb) img.src = e.thumb; else missing.push([e, img]);
       const meta = document.createElement("div"); meta.className = "meta";
       const b = document.createElement("b"); b.textContent = e.prompt;
-      meta.append(b, document.createTextNode(`${e.lora ? "Custom LoRA" : (e.preset || "").split("—")[0].trim()} · seed ${e.seed ?? "?"}`));
+      meta.append(b, document.createTextNode(e.kind === "join" ? "Joined" : `${e.lora ? "Custom LoRA" : (e.preset || "").split("—")[0].trim()} · seed ${e.seed ?? "?"}`));
       el.append(img, meta);
-      el.onclick = () => play(e); el.onkeydown = (k) => { if (k.key === "Enter") play(e); };
+      el.onclick = () => (selecting ? toggleSelect(e, el) : play(e)); el.onkeydown = (k) => { if (k.key === "Enter") el.onclick(); };
+      const at = selected.findIndex((x) => x.id === e.id);
+      if (selecting && at >= 0) { el.classList.add("sel"); el.append(Object.assign(document.createElement("span"), { className: "order", textContent: at + 1 })); }
       box.append(el);
     }
     // Videos saved before thumbnails existed: decode them one by one (phones struggle with many at once).
