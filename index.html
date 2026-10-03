@@ -794,7 +794,7 @@ input[type], select, textarea { font-size: 16px; }
   }
 
   let objectUrl = null;
-  function play(entry) {
+  function play(entry, fromTap = false) {
     if (objectUrl) URL.revokeObjectURL(objectUrl);
     const src = entry.blob ? (objectUrl = URL.createObjectURL(entry.blob)) : entry.url;
     $("stage").innerHTML = "";
@@ -806,6 +806,11 @@ input[type], select, textarea { font-size: 16px; }
     if (entry.thumb) v.poster = entry.thumb;              // iPhone shows black until playback otherwise
     v.src = src;
     $("stage").append(v);
+    if (fromTap) {
+      // Started inside the tap, so iPhone Safari allows sound; if it still refuses, play muted rather than sit still.
+      v.play().catch(() => { v.muted = true; v.play().catch(() => {}); });
+      $("stage").scrollIntoView({ behavior: "smooth", block: "center" });
+    }
     $("report").textContent = [entry.prompt, entry.report].filter(Boolean).join("  ·  ");
     const acts = $("resultActions"); acts.classList.remove("hidden"); acts.innerHTML = "";
     const a = document.createElement("a"); a.className = "button"; a.href = src; a.download = fileName(entry); a.textContent = "Download";
@@ -951,7 +956,7 @@ input[type], select, textarea { font-size: 16px; }
       const b = document.createElement("b"); b.textContent = e.prompt;
       meta.append(b, document.createTextNode(e.kind === "join" ? "Joined" : `${e.lora ? "Custom LoRA" : (e.preset || "").split("—")[0].trim()} · seed ${e.seed ?? "?"}`));
       el.append(img, meta);
-      el.onclick = () => (selecting ? toggleSelect(e, el) : play(e)); el.onkeydown = (k) => { if (k.key === "Enter") el.onclick(); };
+      el.onclick = () => (selecting ? toggleSelect(e, el) : play(e, true)); el.onkeydown = (k) => { if (k.key === "Enter") el.onclick(); };
       const at = selected.findIndex((x) => x.id === e.id);
       if (selecting && at >= 0) { el.classList.add("sel"); el.append(Object.assign(document.createElement("span"), { className: "order", textContent: at + 1 })); }
       box.append(el);
