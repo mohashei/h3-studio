@@ -155,6 +155,14 @@ input[type], select, textarea { font-size: 16px; }
       <label for="prompt">Prompt</label>
       <textarea id="prompt" placeholder="A red fox trotting through a snowy pine forest at dawn, snow crunching underfoot"></textarea>
 
+      <div id="engineRow" class="hidden">
+        <label for="engine">Engine</label>
+        <select id="engine">
+          <option value="ultra">Ultra Fast: 4-bit Space engine, quickest</option>
+          <option value="comfy">ComfyUI: full 8-bit model, best for LoRAs</option>
+        </select>
+      </div>
+
       <label for="preset">Speed and quality</label>
       <select id="preset"></select>
       <p class="hint" id="presetHint"></p>
@@ -246,6 +254,8 @@ input[type], select, textarea { font-size: 16px; }
     <p class="hint" style="margin:0 0 8px">Stored only in this browser. Nothing is sent anywhere except RunPod.</p>
     <label for="cfgEndpoint">Queue endpoint ID</label>
     <input type="text" id="cfgEndpoint" autocomplete="off" spellcheck="false" placeholder="e.g. abc123xyz" required>
+    <label for="cfgComfy">ComfyUI endpoint ID (optional)</label>
+    <input type="text" id="cfgComfy" autocomplete="off" spellcheck="false" placeholder="Adds the ComfyUI engine">
     <label for="cfgRunpod">RunPod API key</label>
     <input type="password" id="cfgRunpod" autocomplete="off" placeholder="rpa_…" required>
     <p class="hint">Use a restricted key (RunPod → Settings → API Keys → Restricted) that can only use this endpoint.</p>
@@ -267,7 +277,7 @@ input[type], select, textarea { font-size: 16px; }
   const $ = (id) => document.getElementById(id);
 
   // ---------------------------------------------------------------- defaults (refreshed from the worker)
-  const DEFAULT_PRESET = "HyperFlow 8-step — best turbo";
+  let DEFAULT_PRESET = "HyperFlow 8-step — best turbo";
   let PRESETS = [
     { value: "Balanced — best overall (recommended)", steps: 28, description: "Full quality schedule with conservative cache acceleration." },
     { value: "Turbo 8-step — faster, cleaner", steps: 8, description: "The Space's distilled eight-step path." },
@@ -284,6 +294,24 @@ input[type], select, textarea { font-size: 16px; }
     "544x960 · 9:16 fast", "640x1152 · 9:16", "768x1344 · 9:16 full", "544x544 · 1:1 fast", "768x768 · 1:1 full",
     "768x576 · 4:3 fast", "1024x768 · 4:3 full", "576x768 · 3:4 fast", "768x1024 · 3:4 full", "1152x512 · 21:9 fast", "1536x672 · 21:9 full"];
 
+  // Two engines: the Ultra Fast Space worker (cfg.endpoint) and the ComfyUI worker (cfg.comfyEndpoint).
+  // Each has its own presets (refreshed from its warmup) and remembered preset choice.
+  const ENGINE_DEFAULTS = {
+    ultra: { presets: PRESETS, canvases: CANVASES, default_preset: DEFAULT_PRESET },
+    comfy: {
+      default_preset: "Turbo 8-step — recommended", lora_stacks: true,
+      presets: [
+        { value: "Turbo 8-step — recommended", steps: 8, description: "LightX2V 8-step LoRA on the full 8-bit model." },
+        { value: "Turbo 4-step — fastest", steps: 4, description: "LightX2V 4-step LoRA (trained at 768p); quickest, rougher motion." },
+        { value: "Quality 20-step — no turbo", steps: 20, description: "ComfyUI's default H3 schedule, no speed LoRA." },
+        { value: "Max 40-step — slowest", steps: 40, description: "Long schedule for detailed scenes, no speed LoRA." },
+      ],
+      canvases: ["960x544 · 16:9 fast", "1152x640 · 16:9", "1344x768 · 16:9 full", "544x960 · 9:16 fast", "640x1152 · 9:16",
+        "768x1344 · 9:16 full", "544x544 · 1:1 fast", "768x768 · 1:1 full", "768x576 · 4:3 fast", "1024x768 · 4:3 full",
+        "576x768 · 3:4 fast", "768x1024 · 3:4 full", "1152x512 · 21:9 fast", "1536x672 · 21:9 full"],
+    },
+  };
+
   // ---------------------------------------------------------------- storage (all optional)
   const store = {
     get(k, fallback) { try { const v = localStorage.getItem("h3studio." + k); return v == null ? fallback : JSON.parse(v); } catch { return fallback; } },
@@ -293,13 +321,13 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const api = async (method, path, body) => {
+  const api = async (method, path, body, ep = engineEp()) => {
     const base = store.get("apiBase", "https://api.runpod.ai");   // override exists only for local testing
     // iPhone Safari can leave a request hanging forever after the app was in the background: give up after 20 s
     const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 20000);
     let res, text;
     try {
-      res = await fetch(`${base}/v2/${encodeURIComponent(cfg.endpoint)}${path}`, {
+      res = await fetch(`${base}/v2/${encodeURIComponent(ep)}${path}`, {
         method, headers: { Authorization: `Bearer ${cfg.runpodKey}`, "Content-Type": "application/json" },
         body: body ? JSON.stringify(body) : undefined, signal: ctl.signal,
       });
@@ -315,12 +343,16 @@ input[type], select, textarea { font-size: 16px; }
     return data;
   };
   const connected = () => cfg.endpoint && cfg.runpodKey && cfg.h3Key;
+  let engine = store.get("engine", "ultra");
+  const activeEngine = () => (engine === "comfy" && cfg.comfyEndpoint ? "comfy" : "ultra");
+  const engineEp = (e = activeEngine()) => (e === "comfy" ? cfg.comfyEndpoint : cfg.endpoint);
+  const engineKey = (k, e = activeEngine()) => (e === "comfy" ? `${k}.comfy` : k);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ---------------------------------------------------------------- form
   const presetSel = $("preset"), canvasSel = $("canvas"), duration = $("duration"), seed = $("seed");
   function fillSelects() {
-    const keepP = presetSel.value || store.get("preset", DEFAULT_PRESET), keepC = canvasSel.value || store.get("canvas", CANVASES[0]);
+    const keepP = presetSel.value || store.get(engineKey("preset"), DEFAULT_PRESET), keepC = canvasSel.value || store.get("canvas", CANVASES[0]);
     presetSel.innerHTML = ""; canvasSel.innerHTML = "";
     for (const p of PRESETS) {
       const o = document.createElement("option"); o.value = p.value;
@@ -337,7 +369,7 @@ input[type], select, textarea { font-size: 16px; }
   }
   function showPresetHint() { const p = PRESETS.find((x) => x.value === presetSel.value); $("presetHint").textContent = p ? p.description || "" : ""; }
   function showDuration() { $("durationText").textContent = `${duration.value} s`; }
-  presetSel.onchange = () => { store.set("preset", presetSel.value); showPresetHint(); };
+  presetSel.onchange = () => { store.set(engineKey("preset"), presetSel.value); showPresetHint(); };
   canvasSel.onchange = () => store.set("canvas", canvasSel.value);
   duration.oninput = () => { showDuration(); store.set("duration", duration.value); };
   seed.onchange = () => store.set("seed", seed.value);
@@ -351,13 +383,26 @@ input[type], select, textarea { font-size: 16px; }
   $("prompt").value = store.get("prompt", "");
   $("prompt").oninput = () => store.set("prompt", $("prompt").value);
   duration.value = store.get("duration", 5); seed.value = store.get("seed", 42);
-  const savedConfig = store.get("serverConfig", null);
-  if (savedConfig) applyServerConfig(savedConfig);
-  fillSelects(); showDuration();
+  // Switch the form to the chosen engine's presets and formats (its worker's last config, else the defaults).
+  let loraReady = false;                                   // the LoRA fields are set up further down
+  function applyEngine() {
+    const e = activeEngine();
+    $("engineRow").classList.toggle("hidden", !cfg.comfyEndpoint);
+    $("engine").value = e;
+    applyServerConfig(ENGINE_DEFAULTS[e]);
+    const saved = store.get(engineKey("serverConfig", e), null);
+    if (saved) applyServerConfig(saved);
+    presetSel.innerHTML = "";
+    fillSelects();
+    if (loraReady) showLora();
+  }
+  $("engine").onchange = () => { engine = $("engine").value; store.set("engine", engine); applyEngine(); pollHealth(); };
+  applyEngine(); showDuration();
 
   function applyServerConfig(c) {
     if (Array.isArray(c.presets) && c.presets.length) PRESETS = c.presets.filter((p) => !p.custom).map((p) => ({ value: p.value, steps: p.steps, description: p.description }));
     if (Array.isArray(c.canvases) && c.canvases.length) CANVASES = c.canvases.map((x) => x.label || x);
+    if (c.default_preset) DEFAULT_PRESET = c.default_preset;
     if (c.duration) { duration.min = c.duration.min ?? 2; duration.max = c.duration.max ?? 14; }
   }
 
@@ -463,15 +508,19 @@ input[type], select, textarea { font-size: 16px; }
   function showLora() {
     const on = loraUrl.value.trim() !== "";
     $("loraOpts").classList.toggle("hidden", !on);
-    presetSel.disabled = on;
+    const stacks = activeEngine() === "comfy";
+    presetSel.disabled = on && !stacks;
+    loraSteps.classList.toggle("hidden", stacks); loraSteps.previousElementSibling.classList.toggle("hidden", stacks);
     $("loraStrengthText").textContent = Number(loraStrength.value).toFixed(2);
-    if (on) { try { downloadUrl(loraUrl.value); $("loraHint").classList.remove("error"); $("loraHint").textContent = "Replaces the speed preset (one LoRA at a time). Speed LoRAs: their step count (3–8). Style LoRAs: 20–28."; }
+    if (on) { try { downloadUrl(loraUrl.value); $("loraHint").classList.remove("error");
+                    $("loraHint").textContent = stacks ? "Applied on top of the speed preset. If a style LoRA looks off with Turbo, try Quality 20-step."
+                                                       : "Replaces the speed preset (one LoRA at a time). Speed LoRAs: their step count (3–8). Style LoRAs: 20–28."; }
               catch (e) { $("loraHint").textContent = e.message; $("loraHint").classList.add("error"); } }
   }
   loraUrl.oninput = () => { store.set("loraUrl", loraUrl.value.trim()); showLora(); };
   loraStrength.oninput = () => { store.set("loraStrength", loraStrength.value); showLora(); };
   loraSteps.onchange = () => store.set("loraSteps", loraSteps.value);
-  showLora();
+  loraReady = true; showLora();
 
   /** Page links -> direct download links. Throws with a helpful message when it can't tell which file. */
   function downloadUrl(raw) {
@@ -579,7 +628,7 @@ input[type], select, textarea { font-size: 16px; }
     try {
       const out = await runJob("warmup", { action: "warmup" });
       if (!out) return;
-      if (out.config) { store.set("serverConfig", out.config); applyServerConfig(out.config); fillSelects(); }
+      if (out.config) { store.set(engineKey("serverConfig"), out.config); applyServerConfig(out.config); fillSelects(); }
       showStatus("Worker ready. It stays up 2 minutes after the last job.", { progress: 1 });
     } catch (e) { showStatus(e.message, { error: true }); }
   };
@@ -590,14 +639,15 @@ input[type], select, textarea { font-size: 16px; }
   let queue = (store.get("queue", []) || []).filter((j) => !j.done || Date.now() - (j.t || 0) < 6 * 3600e3);
   let polling = false;
   const active = () => queue.filter((j) => !j.done);
-  function saveQueue() { store.set("queue", queue.slice(-40).map(({ id, kind, label, seed, input, state, text, done, bad, t }) =>
-                                                         ({ id, kind, label, seed, input, state, text, done, bad, t }))); }
+  function saveQueue() { store.set("queue", queue.slice(-40).map(({ id, ep, kind, label, seed, input, state, text, done, bad, t }) =>
+                                                         ({ id, ep, kind, label, seed, input, state, text, done, bad, t }))); }
 
   async function submit(kind, input, label, seedValue) {
-    const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } });
+    const ep = engineEp();
+    const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } }, ep);
     const { image, last_image, clips, ...meta } = input;                    // keep localStorage small
     if (clips) meta.clips = clips.map(({ b64, ...c }) => c);
-    queue.push({ id: job.id, kind, label, seed: seedValue, input: meta, state: "IN_QUEUE", text: "Queued", done: false, t: Date.now() });
+    queue.push({ id: job.id, ep, kind, label, seed: seedValue, input: meta, state: "IN_QUEUE", text: "Queued", done: false, t: Date.now() });
     saveQueue(); renderQueue(); ensurePolling();
     return job.id;
   }
@@ -606,7 +656,7 @@ input[type], select, textarea { font-size: 16px; }
     if (!connected()) { openSettings(); return; }
     const prompt = $("prompt").value.trim();
     if (!prompt) { $("prompt").focus(); showStatus("Write a prompt first.", { error: true }); return; }
-    const base = { action: "generate", prompt, preset: presetSel.value, canvas: canvasSel.value, duration: Number(duration.value) };
+    const base = { action: "generate", engine: activeEngine(), prompt, preset: presetSel.value, canvas: canvasSel.value, duration: Number(duration.value) };
     if (frames.first) base.image = frames.first;
     else if (startJob) base.start_from = { job: startJob.id };
     if (frames.last) base.last_image = frames.last;
@@ -677,7 +727,7 @@ input[type], select, textarea { font-size: 16px; }
         await Promise.all(active().map(async (j) => {
           let s;
           if (!connected()) return;
-          try { s = await api("GET", `/status/${j.id}`); }
+          try { s = await api("GET", `/status/${j.id}`, null, j.ep || cfg.endpoint); }
           catch (e) {
             if (!connected()) return;                    // locked mid-request: not the job's fault
             // RunPod forgets finished jobs after a while, and a lost job never comes back: end it here
@@ -726,12 +776,15 @@ input[type], select, textarea { font-size: 16px; }
     const targets = active().filter((j) => ids.has(j.id));
     targets.forEach((j) => { j.stopping = true; }); renderQueue();
     // RunPod's cancel ends the job in any state; the worker cancel stops a running generation at its next step
-    await Promise.all(targets.map((j) => api("POST", `/cancel/${j.id}`).catch(() => {})));
-    // Only when a worker is actually busy: otherwise this cancel would itself start a GPU worker
-    const started = targets.filter((j) => j.state === "IN_PROGRESS").map((j) => j.id);
-    await pollHealth();
-    const busy = health && (((health.workers || {}).running || 0) > 0 || ((health.jobs || {}).inProgress || 0) > 0);
-    if (started.length && busy) await api("POST", "/run", { input: { action: "cancel", job_ids: started, api_key: cfg.h3Key } }).catch(() => {});
+    await Promise.all(targets.map((j) => api("POST", `/cancel/${j.id}`, null, j.ep || cfg.endpoint).catch(() => {})));
+    // Worker-side cancel only where a worker is actually busy: otherwise it would itself start a GPU worker
+    const byEp = {};
+    for (const j of targets.filter((j) => j.state === "IN_PROGRESS")) (byEp[j.ep || cfg.endpoint] ||= []).push(j.id);
+    await Promise.all(Object.entries(byEp).map(async ([ep, ids]) => {
+      const h = await api("GET", "/health", null, ep).catch(() => null);
+      const busy = h && (((h.workers || {}).running || 0) > 0 || ((h.jobs || {}).inProgress || 0) > 0);
+      if (busy) await api("POST", "/run", { input: { action: "cancel", job_ids: ids, api_key: cfg.h3Key } }, ep).catch(() => {});
+    }));
     ensurePolling();
     // Whatever still hasn't ended in 20 s is dropped from the queue, so Stop always works
     setTimeout(() => {
@@ -796,7 +849,7 @@ input[type], select, textarea { font-size: 16px; }
     const entry = { id: Date.now(), created: new Date().toISOString(),
                     prompt: input.kind === "join" ? (input.label || "Joined clips") : (input.prompt || "(resumed job)"),
                     jobId: input.jobId || null, parentJob: input.parent || null, kind: input.kind || "generate",
-                    preset: input.preset || "", canvas: input.canvas || "", duration: input.duration, seed: out.seed ?? input.seed,
+                    engine: input.engine || "ultra", preset: input.preset || "", canvas: input.canvas || "", duration: input.duration, seed: out.seed ?? input.seed,
                     lora: input.lora ? { link: loraUrl.value.trim(), strength: input.lora.strength, steps: input.lora.steps } : null,
                     report: out.report || "", blob, url: out.video_url || null };
     if (blob) entry.thumb = await makeThumb(blob);
@@ -878,6 +931,8 @@ input[type], select, textarea { font-size: 16px; }
     const reuse = document.createElement("button"); reuse.className = "small"; reuse.textContent = "Reuse settings";
     reuse.onclick = () => {
       if (entry.prompt && entry.prompt !== "(resumed job)") $("prompt").value = entry.prompt;
+      const e = entry.engine || "ultra";
+      if (e !== activeEngine() && (e === "ultra" || cfg.comfyEndpoint)) { engine = e; store.set("engine", e); applyEngine(); }
       if (entry.preset) presetSel.value = entry.preset;
       if (entry.canvas) canvasSel.value = entry.canvas;
       if (entry.duration) { duration.value = entry.duration; showDuration(); }
@@ -1027,16 +1082,16 @@ input[type], select, textarea { font-size: 16px; }
   // ---------------------------------------------------------------- settings
   const dlg = $("settings");
   function openSettings() {
-    $("cfgEndpoint").value = cfg.endpoint; $("cfgRunpod").value = cfg.runpodKey; $("cfgH3").value = cfg.h3Key;
+    $("cfgEndpoint").value = cfg.endpoint; $("cfgComfy").value = cfg.comfyEndpoint || ""; $("cfgRunpod").value = cfg.runpodKey; $("cfgH3").value = cfg.h3Key;
     $("cfgCivitai").value = cfg.civitaiToken || "";
     dlg.showModal();
   }
   $("settingsBtn").onclick = openSettings;
   $("settingsForm").onsubmit = () => {
-    cfg = { endpoint: $("cfgEndpoint").value.trim(), runpodKey: $("cfgRunpod").value.trim(), h3Key: $("cfgH3").value.trim(),
-            civitaiToken: $("cfgCivitai").value.trim() };
+    cfg = { endpoint: $("cfgEndpoint").value.trim(), comfyEndpoint: $("cfgComfy").value.trim(), runpodKey: $("cfgRunpod").value.trim(),
+            h3Key: $("cfgH3").value.trim(), civitaiToken: $("cfgCivitai").value.trim() };
     if ($("cfgRemember").checked) sealCfg(); else store.del("cfgSealed");
-    pollHealth();
+    applyEngine(); pollHealth();
   };
   $("forgetBtn").onclick = () => { store.del("cfgSealed"); store.del("cfg"); cfg = { endpoint: "", runpodKey: "", h3Key: "" }; dlg.close(); setPill("", "Not connected"); };
 
@@ -1094,7 +1149,7 @@ input[type], select, textarea { font-size: 16px; }
   }
   function unlocked() {
     lockEl.classList.add("hidden");
-    renderHistory(); renderQueue();
+    applyEngine(); renderHistory(); renderQueue();
     if (!connected()) openSettings(); else { pollHealth(); ensurePolling(); }
   }
 
