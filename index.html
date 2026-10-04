@@ -301,7 +301,10 @@ input[type], select, textarea { font-size: 16px; }
     });
     const text = await res.text();
     let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
-    if (!res.ok) throw new Error(res.status === 401 ? "RunPod rejected the API key (check Settings)." : (data.error || data.detail || `RunPod error ${res.status}`));
+    if (!res.ok) {
+      const err = new Error(res.status === 401 ? "RunPod rejected the API key (check Settings)." : (data.error || data.detail || `RunPod error ${res.status}`));
+      err.status = res.status; throw err;
+    }
     return data;
   };
   const connected = () => cfg.endpoint && cfg.runpodKey && cfg.h3Key;
@@ -666,8 +669,18 @@ input[type], select, textarea { font-size: 16px; }
       while (active().length) {
         await Promise.all(active().map(async (j) => {
           let s;
-          try { s = await api("GET", `/status/${j.id}`); } catch (e) { j.text = e.message; return; }
-          j.state = s.status;
+          try { s = await api("GET", `/status/${j.id}`); }
+          catch (e) {
+            // RunPod forgets finished jobs after a while, and a lost job never comes back: end it here
+            // instead of polling forever. Other errors (offline, hiccups) get about a minute of retries.
+            j.errs = (j.errs || 0) + 1;
+            if (e.status === 404 || j.stopping || j.errs >= 20) {
+              j.done = true; j.bad = true;
+              j.text = j.stopping ? "Stopped." : e.status === 404 ? "RunPod no longer has this job (it may have crashed the worker)." : e.message;
+            } else j.text = `${e.message} (retrying)`;
+            return;
+          }
+          j.errs = 0; j.state = s.status;
           if (s.status === "IN_QUEUE") j.text = j.stopping ? "Cancelling…" : "Queued";
           else if (s.status === "IN_PROGRESS") j.text = j.stopping ? "Stopping…" : (typeof s.output === "string" ? s.output : "Working…");
           else if (s.status === "COMPLETED") {
@@ -702,9 +715,17 @@ input[type], select, textarea { font-size: 16px; }
     }
     const targets = active().filter((j) => ids.has(j.id));
     targets.forEach((j) => { j.stopping = true; }); renderQueue();
-    await Promise.all(targets.filter((j) => j.state === "IN_QUEUE").map((j) => api("POST", `/cancel/${j.id}`).catch(() => {})));
-    const started = targets.filter((j) => j.state !== "IN_QUEUE").map((j) => j.id);
-    if (started.length) await api("POST", "/run", { input: { action: "cancel", job_ids: started, api_key: cfg.h3Key } }).catch((e) => showStatus("Stop failed: " + e.message, { error: true }));
+    // RunPod's cancel ends the job in any state; the worker cancel stops a running generation at its next step
+    await Promise.all(targets.map((j) => api("POST", `/cancel/${j.id}`).catch(() => {})));
+    const started = targets.filter((j) => j.state === "IN_PROGRESS").map((j) => j.id);
+    if (started.length) await api("POST", "/run", { input: { action: "cancel", job_ids: started, api_key: cfg.h3Key } }).catch(() => {});
+    ensurePolling();
+    // Whatever still hasn't ended in 20 s is dropped from the queue, so Stop always works
+    setTimeout(() => {
+      const stuck = targets.filter((j) => !j.done);
+      stuck.forEach((j) => { j.done = true; j.bad = true; j.text = "Stopped."; });
+      if (stuck.length) { saveQueue(); renderQueue(); }
+    }, 20000);
   }
   $("stopBtn").onclick = () => cancelJobs(active());
   $("clearDone").onclick = () => { queue = queue.filter((j) => !j.done); saveQueue(); renderQueue(); };
