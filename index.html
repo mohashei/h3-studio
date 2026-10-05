@@ -414,6 +414,7 @@ input[type], select, textarea { font-size: 16px; }
 
   let startJob = null;          // { id, label }: start from the last frame of a job that hasn't finished yet
   let continueFrom = null;      // job id of a finished clip that "Continue" took its last frame from
+  let continueAt = null;        // seconds into that clip when the start frame came from the middle of it (Join cuts there)
   function setStartJob(job, preview = null) {
     const { box } = slots.first;
     frames.first = null; startJob = job;
@@ -428,7 +429,7 @@ input[type], select, textarea { font-size: 16px; }
   function emptySlot(which) {
     const { box } = slots[which];
     frames[which] = null;
-    if (which === "first") { startJob = null; continueFrom = null; }
+    if (which === "first") { startJob = null; continueFrom = null; continueAt = null; }
     box.innerHTML = `<span>${LABEL[which]}<br><small>tap to choose · drop · paste</small></span>` +
                     `<button class="paste small" type="button" aria-label="Paste ${LABEL[which].toLowerCase()} from clipboard">Paste</button>`;
     box.querySelector(".paste").onclick = (e) => { e.stopPropagation(); lastSlot = which; pasteFromClipboard(which); };
@@ -662,6 +663,7 @@ input[type], select, textarea { font-size: 16px; }
     if (frames.last) base.last_image = frames.last;
     const parent = startJob ? startJob.id : continueFrom;
     if (parent) base.parent = parent;
+    if (parent && continueAt != null) base.parent_at = continueAt;
     if (loraUrl.value.trim()) {
       try { base.lora = { url: downloadUrl(loraUrl.value), strength: Number(loraStrength.value), steps: Number(loraSteps.value) || 8 }; }
       catch (e) { showStatus(e.message, { error: true }); loraUrl.focus(); return; }
@@ -682,8 +684,8 @@ input[type], select, textarea { font-size: 16px; }
   // Clips that lead up to `id` through Continue links, oldest first (queued jobs and History both count).
   async function chainTo(id) {
     const hist = await db.all(), byJob = new Map();
-    for (const e of hist) if (e.jobId) byJob.set(e.jobId, { id: e.jobId, parent: e.parentJob, entry: e, label: e.prompt });
-    for (const j of queue) if (j.kind === "generate" && !byJob.has(j.id)) byJob.set(j.id, { id: j.id, parent: j.input.parent, job: j, label: j.label });
+    for (const e of hist) if (e.jobId) byJob.set(e.jobId, { id: e.jobId, parent: e.parentJob, at: e.parentAt ?? null, entry: e, label: e.prompt });
+    for (const j of queue) if (j.kind === "generate" && !byJob.has(j.id)) byJob.set(j.id, { id: j.id, parent: j.input.parent, at: j.input.parent_at ?? null, job: j, label: j.label });
     const chain = [];
     for (let cur = byJob.get(id); cur && chain.length < 24; cur = cur.parent ? byJob.get(cur.parent) : null) chain.unshift(cur);
     return chain;
@@ -691,12 +693,15 @@ input[type], select, textarea { font-size: 16px; }
 
   // A clip reference the worker understands: by job id (waited for if still running, else read from its store),
   // or the video itself for clips the worker no longer keeps (older than ~a week, or from before job ids were saved).
-  async function clipRef(node, prev) {
-    const trim_first = !!(prev && node.parent && node.parent === prev.id);   // a continuation repeats the previous last frame
+  // A continuation from the last frame repeats it, so its first frame is dropped; one that started from a frame in the
+  // middle keeps its first frame and the previous clip is cut just before that frame instead (`end`, in seconds).
+  async function clipRef(node, prev, next) {
+    const trim_first = !!(prev && node.parent && node.parent === prev.id && node.at == null);
+    const cut = next && next.parent && next.parent === node.id && next.at != null ? { end: next.at } : {};
     const e = node.entry;
-    if (node.job && !node.job.done) return { job: node.id, wait: true, trim_first };
-    if (e && e.jobId && Date.now() - new Date(e.created).getTime() < 6 * 86400e3) return { job: e.jobId, wait: false, trim_first };
-    if (e && e.blob) return { b64: await blobB64(e.blob), trim_first };
+    if (node.job && !node.job.done) return { job: node.id, wait: true, trim_first, ...cut };
+    if (e && e.jobId && Date.now() - new Date(e.created).getTime() < 6 * 86400e3) return { job: e.jobId, wait: false, trim_first, ...cut };
+    if (e && e.blob) return { b64: await blobB64(e.blob), trim_first, ...cut };
     throw new Error(`"${node.label}" isn't available to join any more.`);
   }
   const blobB64 = (b) => new Promise((res) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.readAsDataURL(b); });
@@ -705,7 +710,7 @@ input[type], select, textarea { font-size: 16px; }
     if (nodes.length < 2) { showStatus("A join needs at least two clips.", { error: true }); return; }
     try {
       const clips = [];
-      for (let i = 0; i < nodes.length; i++) clips.push(await clipRef(nodes[i], nodes[i - 1]));
+      for (let i = 0; i < nodes.length; i++) clips.push(await clipRef(nodes[i], nodes[i - 1], nodes[i + 1]));
       const size = clips.reduce((a, c) => a + (c.b64 ? c.b64.length : 0), 0);
       if (size > 9e6) throw new Error("Too much video to upload in one join; join fewer older clips at a time.");
       await submit("join", { action: "join", clips }, `Join ${nodes.length}: ${why}`.slice(0, 70));
@@ -848,7 +853,7 @@ input[type], select, textarea { font-size: 16px; }
     }
     const entry = { id: Date.now(), created: new Date().toISOString(),
                     prompt: input.kind === "join" ? (input.label || "Joined clips") : (input.prompt || "(resumed job)"),
-                    jobId: input.jobId || null, parentJob: input.parent || null, kind: input.kind || "generate",
+                    jobId: input.jobId || null, parentJob: input.parent || null, parentAt: input.parent_at ?? null, kind: input.kind || "generate",
                     engine: input.engine || "ultra", preset: input.preset || "", canvas: input.canvas || "", duration: input.duration, seed: out.seed ?? input.seed,
                     lora: input.lora ? { link: loraUrl.value.trim(), strength: input.lora.strength, steps: input.lora.steps } : null,
                     report: out.report || "", blob, url: out.video_url || null };
@@ -959,7 +964,7 @@ input[type], select, textarea { font-size: 16px; }
           }
           emptySlot("last");
           if (entry.canvas && [...canvasSel.options].some((o) => o.value === entry.canvas)) { canvasSel.value = entry.canvas; store.set("canvas", entry.canvas); }
-          continueFrom = entry.jobId || null;
+          continueFrom = entry.jobId || null; continueAt = null;
           const box = $("prompt");
           box.scrollIntoView({ behavior: "smooth", block: "center" });
           box.focus({ preventScroll: true }); box.setSelectionRange(box.value.length, box.value.length);
@@ -968,6 +973,11 @@ input[type], select, textarea { font-size: 16px; }
         finally { cont.disabled = false; }
       };
       acts.prepend(cont);
+      // Any frame: pause the player where you want the next clip to start.
+      const here = document.createElement("button"); here.className = "small primary"; here.textContent = "Start from this frame";
+      here.title = "Pause the video on a frame, then start the next video from it";
+      here.onclick = () => useFrameHere(v, entry, "first", here, () => cont.click());
+      cont.after(here);
       if (entry.parentJob) {
         const jc = document.createElement("button"); jc.className = "small"; jc.textContent = "Join chain";
         jc.title = "Join this clip with the clips it continues from, in order";
@@ -993,6 +1003,10 @@ input[type], select, textarea { font-size: 16px; }
         };
         frameRow.append(b);
       }
+      const hereEnd = document.createElement("button"); hereEnd.className = "small"; hereEnd.textContent = "This frame → End";
+      hereEnd.title = "Put the frame the player is on in the Last frame (end) slot";
+      hereEnd.onclick = () => useFrameHere(v, entry, "last", hereEnd);
+      frameRow.prepend(hereEnd);
       acts.append(more);
     }
     if (entry.id && entry.blob) {
@@ -1000,6 +1014,32 @@ input[type], select, textarea { font-size: 16px; }
       del.onclick = async () => { await db.del(entry.id); renderHistory(); $("stage").innerHTML = '<div class="empty">Deleted.</div>'; acts.classList.add("hidden"); $("report").textContent = ""; };
       acts.append(del);
     }
+  }
+  // The frame the player is showing, into the start or end slot. Times snap to the 24 fps frame grid: the frame
+  // is read from the middle of its interval (robust to seek rounding), and a Join cuts the source clip at its start.
+  async function useFrameHere(v, entry, to, btn, atLastFrame = null) {
+    v.pause();
+    const fps = 24, n = Math.floor(v.currentTime * fps + 1e-3), total = Math.round((v.duration || 0) * fps);
+    if (atLastFrame && total && n >= total - 1) { atLastFrame(); return; }   // on the last frame it's a plain Continue
+    btn.disabled = true;
+    try {
+      await setFrame(to, await canvasBlob(await grabFrame(entry.blob, (n + 0.5) / fps)));
+      const at = `${(n / fps).toFixed(2)} s`;
+      if (to === "first") {
+        emptySlot("last");
+        if (entry.canvas && [...canvasSel.options].some((o) => o.value === entry.canvas)) { canvasSel.value = entry.canvas; store.set("canvas", entry.canvas); }
+        continueFrom = n > 0 ? entry.jobId || null : null;      // from the very first frame there's nothing to join before it
+        continueAt = continueFrom ? n / fps : null;
+        const box = $("prompt");
+        box.scrollIntoView({ behavior: "smooth", block: "center" });
+        box.focus({ preventScroll: true }); box.setSelectionRange(box.value.length, box.value.length);
+        showStatus(`Start frame set from ${at}. Now describe what happens next, then Generate.`, { progress: 1 });
+      } else {
+        showStatus(`Frame at ${at} set as the end keyframe.`, { progress: 1 });
+        $("lastFrame").scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    } catch (e) { showStatus(e.message, { error: true }); }
+    finally { btn.disabled = false; }
   }
   const fileName = (e) => `h3-${(e.created || "").slice(0, 16).replace(/[:T]/g, "-")}-seed${e.seed ?? "x"}.mp4`;
 
@@ -1044,7 +1084,7 @@ input[type], select, textarea { font-size: 16px; }
   $("selectBtn").onclick = () => setSelecting(true);
   $("joinCancel").onclick = () => setSelecting(false);
   $("joinSelected").onclick = async () => {
-    const nodes = selected.map((e) => ({ id: e.jobId || `local-${e.id}`, parent: e.parentJob, entry: e, label: e.prompt }));
+    const nodes = selected.map((e) => ({ id: e.jobId || `local-${e.id}`, parent: e.parentJob, at: e.parentAt ?? null, entry: e, label: e.prompt }));
     const label = selected.map((e) => e.prompt).join(" → ");
     setSelecting(false);
     await queueJoin(nodes, label);
