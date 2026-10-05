@@ -213,6 +213,7 @@ input[type], select, textarea { font-size: 16px; }
   <section>
     <div class="card">
       <div class="stage" id="stage"><div class="empty">Your video will appear here.</div></div>
+      <button class="primary hidden" id="nextBtn" type="button" style="width:100%;margin-top:8px"></button>
       <div class="status hidden" id="status">
         <div class="line"><span class="msg" id="statusMsg"></span><span class="time" id="statusTime"></span></div>
         <div class="bar" id="bar"><div></div></div>
@@ -324,14 +325,22 @@ input[type], select, textarea { font-size: 16px; }
   const api = async (method, path, body, ep = engineEp()) => {
     const base = store.get("apiBase", "https://api.runpod.ai");   // override exists only for local testing
     // iPhone Safari can leave a request hanging forever after the app was in the background: give up after 20 s
-    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 20000);
-    let res, text;
+    // without data. Only a stall counts: a finished job's status carries the whole video (several MB of base64),
+    // which can take longer than that on a phone, and restarting it from zero on every poll never gets anywhere.
+    const ctl = new AbortController();
+    let timer, res, text;
+    const arm = () => { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), 20000); };
     try {
+      arm();
       res = await fetch(`${base}/v2/${encodeURIComponent(ep)}${path}`, {
         method, headers: { Authorization: `Bearer ${cfg.runpodKey}`, "Content-Type": "application/json" },
         body: body ? JSON.stringify(body) : undefined, signal: ctl.signal,
       });
-      text = await res.text();
+      if (res.body && res.body.getReader) {
+        const reader = res.body.getReader(), parts = [];
+        for (;;) { arm(); const { done, value } = await reader.read(); if (done) break; parts.push(value); }
+        text = await new Blob(parts).text();
+      } else text = await res.text();
     } catch (e) {
       throw new Error(e.name === "AbortError" ? "RunPod didn't answer in time." : "Can't reach RunPod (offline?).");
     } finally { clearTimeout(timer); }
@@ -645,6 +654,7 @@ input[type], select, textarea { font-size: 16px; }
 
   async function submit(kind, input, label, seedValue) {
     const ep = engineEp();
+    autoShown = false;                                                     // the next result to finish plays
     const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } }, ep);
     const { image, last_image, clips, ...meta } = input;                    // keep localStorage small
     if (clips) meta.clips = clips.map(({ b64, ...c }) => c);
@@ -724,6 +734,7 @@ input[type], select, textarea { font-size: 16px; }
   }
 
   function ensurePolling() { if (!polling && active().length) pollQueue(); }
+  let results = Promise.resolve();
   async function pollQueue() {
     polling = true; current = current || { started: Date.now() };
     let delay = 1500;
@@ -752,7 +763,9 @@ input[type], select, textarea { font-size: 16px; }
             if (s.output && s.output.error) { j.bad = true; j.text = s.output.error; }
             else {
               j.text = `Done in ${fmtTime((s.output && s.output.seconds) || 0)}`;
-              await showResult(s.output || {}, { ...j.input, seed: j.seed, jobId: j.id, kind: j.kind, label: j.label });
+              // In finishing order, without holding up the polling of the other jobs
+              const out = s.output || {}, input = { ...j.input, seed: j.seed, jobId: j.id, kind: j.kind, label: j.label };
+              results = results.then(() => showResult(out, input)).catch((e) => showStatus(`Couldn't show "${j.label}": ${e.message}`, { error: true }));
             }
           } else {
             j.done = true; j.bad = true;
@@ -857,10 +870,20 @@ input[type], select, textarea { font-size: 16px; }
                     engine: input.engine || "ultra", preset: input.preset || "", canvas: input.canvas || "", duration: input.duration, seed: out.seed ?? input.seed,
                     lora: input.lora ? { link: loraUrl.value.trim(), strength: input.lora.strength, steps: input.lora.steps } : null,
                     report: out.report || "", blob, url: out.video_url || null };
-    if (blob) entry.thumb = await makeThumb(blob);
-    play(entry);
+    // The first result since you last queued something plays; later ones wait behind "Next" so a clip you're
+    // watching isn't replaced seconds later. The thumbnail is made by History afterwards, not on the way in.
+    if (!autoShown || !$("stage").querySelector("video")) { autoShown = true; play(entry); }
+    else { pending.push(entry); showNext(); }
     if (blob) { await db.put(entry); renderHistory(); }
   }
+  let autoShown = false;
+  const pending = [];
+  function showNext() {
+    const b = $("nextBtn");
+    b.classList.toggle("hidden", !pending.length);
+    b.textContent = pending.length === 1 ? "▶ Next video ready" : `▶ ${pending.length} new videos ready`;
+  }
+  $("nextBtn").onclick = () => { const e = pending.shift(); showNext(); if (e) play(e, true); };
 
   /** Decode one frame of a video blob: "first", "last", or seconds. Returns a canvas (full size unless maxW).
       iPhone Safari only paints frames after playback starts, so the hidden video is played muted for an instant. */
@@ -902,8 +925,10 @@ input[type], select, textarea { font-size: 16px; }
     try { return (await grabFrame(blob, 0.5, 360)).toDataURL("image/jpeg", 0.8); } catch { return null; }
   }
 
-  let objectUrl = null;
+  let objectUrl = null, stageEntry = null;
   function play(entry, fromTap = false) {
+    stageEntry = entry;
+    const i = pending.indexOf(entry); if (i >= 0) { pending.splice(i, 1); showNext(); }
     if (objectUrl) URL.revokeObjectURL(objectUrl);
     const src = entry.blob ? (objectUrl = URL.createObjectURL(entry.blob)) : entry.url;
     $("stage").innerHTML = "";
@@ -1067,6 +1092,7 @@ input[type], select, textarea { font-size: 16px; }
   })();
 
   let thumbing = false;
+  const thumbTried = new Set();
   let selecting = false, selected = [];
   function toggleSelect(e) {
     const at = selected.findIndex((x) => x.id === e.id);
@@ -1107,14 +1133,22 @@ input[type], select, textarea { font-size: 16px; }
       if (selecting && at >= 0) { el.classList.add("sel"); el.append(Object.assign(document.createElement("span"), { className: "order", textContent: at + 1 })); }
       box.append(el);
     }
-    // Videos saved before thumbnails existed: decode them one by one (phones struggle with many at once).
-    if (!thumbing && missing.length) {
+    // New results and videos saved before thumbnails existed: decode them one by one (phones struggle with many
+    // at once). Anything that arrived meanwhile is picked up by a fresh render; one that can't be decoded is tried once.
+    if (!thumbing && missing.some(([e]) => !thumbTried.has(e.id))) {
       thumbing = true;
       for (const [e, img] of missing) {
+        if (thumbTried.has(e.id)) continue;
+        thumbTried.add(e.id);
         e.thumb = await makeThumb(e.blob);
-        if (e.thumb) { img.src = e.thumb; await db.put(e); }
+        if (e.thumb) {
+          img.src = e.thumb; await db.put(e);
+          const v = $("stage").querySelector("video");
+          if (v && stageEntry && stageEntry.id === e.id && !v.poster) v.poster = e.thumb;        // iPhone shows black until playback otherwise
+        }
       }
       thumbing = false;
+      renderHistory();
     }
   }
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch {}
@@ -1182,7 +1216,8 @@ input[type], select, textarea { font-size: 16px; }
   }
   function lockNow() {
     pinKey = null; cfg = { endpoint: "", runpodKey: "", h3Key: "" };
-    $("stage").innerHTML = '<div class="empty">Your video will appear here.</div>';
+    $("stage").innerHTML = '<div class="empty">Your video will appear here.</div>'; stageEntry = null;
+    pending.length = 0; showNext();
     $("resultActions").classList.add("hidden"); $("report").textContent = ""; $("history").innerHTML = ""; $("batch").innerHTML = "";
     if (dlg.open) dlg.close();
     showLock(store.get("pin", null) ? "unlock" : "setup");
