@@ -322,12 +322,14 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
+  const inflight = new Set();   // AbortControllers of requests in flight (dropped on a return from the background)
   const api = async (method, path, body, ep = engineEp()) => {
     const base = store.get("apiBase", "https://api.runpod.ai");   // override exists only for local testing
     // iPhone Safari can leave a request hanging forever after the app was in the background: give up after 20 s
     // without data. Only a stall counts: a finished job's status carries the whole video (several MB of base64),
     // which can take longer than that on a phone, and restarting it from zero on every poll never gets anywhere.
     const ctl = new AbortController();
+    inflight.add(ctl);
     let timer, res, text;
     const arm = () => { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), 20000); };
     try {
@@ -342,8 +344,9 @@ input[type], select, textarea { font-size: 16px; }
         text = await new Blob(parts).text();
       } else text = await res.text();
     } catch (e) {
+      if (ctl.resumed) { const r = new Error("Interrupted while the app was in the background; try again."); r.resumed = true; throw r; }
       throw new Error(e.name === "AbortError" ? "RunPod didn't answer in time." : "Can't reach RunPod (offline?).");
-    } finally { clearTimeout(timer); }
+    } finally { clearTimeout(timer); inflight.delete(ctl); }
     let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
     if (!res.ok) {
       const err = new Error(res.status === 401 ? "RunPod rejected the API key (check Settings)." : (data.error || data.detail || `RunPod error ${res.status}`));
@@ -357,6 +360,12 @@ input[type], select, textarea { font-size: 16px; }
   const engineEp = (e = activeEngine()) => (e === "comfy" ? cfg.comfyEndpoint : cfg.endpoint);
   const engineKey = (k, e = activeEngine()) => (e === "comfy" ? `${k}.comfy` : k);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // The queue's wait between polls, cut short when the app comes back to the foreground
+  let wakeNap = null, checkNow = false;
+  const nap = (ms) => new Promise((r) => {
+    const t = setTimeout(() => { wakeNap = null; r(); }, ms);
+    wakeNap = () => { clearTimeout(t); wakeNap = null; r(); };
+  });
 
   // ---------------------------------------------------------------- form
   const presetSel = $("preset"), canvasSel = $("canvas"), duration = $("duration"), seed = $("seed");
@@ -571,7 +580,16 @@ input[type], select, textarea { font-size: 16px; }
   }
   function setPill(cls, text) { $("workerDot").className = "dot " + cls; $("workerText").textContent = text; }
   setInterval(() => { if (!document.hidden) pollHealth(); }, 10000);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && connected()) { pollHealth(); ensurePolling(); } });
+  // Back from the background: iOS can leave requests that were in flight frozen for good, and the queue would sit
+  // on them until they time out. After more than a few seconds away, drop them and check everything at once.
+  let backgroundSince = 0;
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { backgroundSince = Date.now(); return; }
+    if (backgroundSince && Date.now() - backgroundSince > 5000) for (const c of inflight) { c.resumed = true; c.abort(); }
+    backgroundSince = 0; checkNow = true;
+    if (wakeNap) wakeNap();
+    if (connected()) { pollHealth(); ensurePolling(); }
+  });
 
   // ---------------------------------------------------------------- jobs
   let current = null;       // { id, kind, started, stopping }
@@ -583,7 +601,12 @@ input[type], select, textarea { font-size: 16px; }
     bar.firstElementChild.style.width = progress === null ? "" : `${Math.round(progress * 100)}%`;
     if (!current) bar.classList.remove("indeterminate");
   }
-  setInterval(() => { if (current) $("statusTime").textContent = fmtTime((Date.now() - current.started) / 1000); }, 500);
+  // How long the running job has been at it (else how long the oldest queued one has waited)
+  setInterval(() => {
+    const open = active(), run = open.find((j) => j.state === "IN_PROGRESS");
+    const t0 = run ? run.runAt || run.t : open.length ? Math.min(...open.map((j) => j.t)) : current && current.started;
+    if (t0) $("statusTime").textContent = fmtTime((Date.now() - t0) / 1000);
+  }, 500);
   const fmtTime = (s) => s < 60 ? `${Math.floor(s)}s` : `${Math.floor(s / 60)}m ${String(Math.floor(s % 60)).padStart(2, "0")}s`;
 
   function setBusy(busy) { $("wakeBtn").disabled = busy; }
@@ -604,7 +627,8 @@ input[type], select, textarea { font-size: 16px; }
   async function follow(id) {
     let delay = 1500;
     for (;;) {
-      const s = await api("GET", `/status/${id}`);
+      let s;
+      try { s = await api("GET", `/status/${id}`); } catch (e) { if (e.resumed) continue; throw e; }
       if (s.status === "IN_QUEUE") {
         const w = (health && health.workers) || {};
         const warm = (w.ready || 0) + (w.idle || 0) + (w.running || 0) > 0;
@@ -743,26 +767,37 @@ input[type], select, textarea { font-size: 16px; }
         await Promise.all(active().map(async (j) => {
           let s;
           if (!connected()) return;
-          try { s = await api("GET", `/status/${j.id}`, null, j.ep || cfg.endpoint); }
+          try { s = await api("GET", `/status/${j.fetchId || j.id}`, null, j.ep || cfg.endpoint); }
           catch (e) {
-            if (!connected()) return;                    // locked mid-request: not the job's fault
+            if (!connected() || e.resumed) return;       // locked or back from the background: not the job's fault
+            // RunPod forgets a finished job's result after a while (e.g. while the app was in the background), but
+            // the worker keeps every video on the volume for a week: ask a worker for it instead of giving up.
+            if (e.status === 404 && !j.stopping && !j.fetchId && (j.kind === "generate" || j.kind === "join")) {
+              try {
+                const f = await api("POST", "/run", { input: { action: "fetch", job: j.id, api_key: cfg.h3Key } }, j.ep || cfg.endpoint);
+                Object.assign(j, { fetchId: f.id, errs: 0, state: "IN_QUEUE", runAt: null, text: "Getting the finished video from the volume…" });
+              } catch (e2) { if (!e2.resumed) j.text = `${e2.message} (retrying)`; }
+              return;
+            }
             // RunPod forgets finished jobs after a while, and a lost job never comes back: end it here
             // instead of polling forever. Other errors (offline, hiccups) get about a minute of retries.
             j.errs = (j.errs || 0) + 1;
             if (e.status === 404 || j.stopping || j.errs >= 20) {
               j.done = true; j.bad = true;
-              j.text = j.stopping ? "Stopped." : e.status === 404 ? "RunPod no longer has this job (it may have crashed the worker)." : e.message;
+              j.text = j.stopping ? "Stopped." : e.status === 404 ? "RunPod no longer has this job, and its video couldn't be recovered." : e.message;
             } else j.text = `${e.message} (retrying)`;
             return;
           }
           j.errs = 0; j.state = s.status;
-          if (s.status === "IN_QUEUE") j.text = j.stopping ? "Cancelling…" : "Queued";
+          if (s.status === "IN_PROGRESS" && !j.runAt) j.runAt = Date.now();
+          if (j.fetchId && (s.status === "IN_QUEUE" || s.status === "IN_PROGRESS")) j.text = "Getting the finished video from the volume…";
+          else if (s.status === "IN_QUEUE") j.text = j.stopping ? "Cancelling…" : "Queued";
           else if (s.status === "IN_PROGRESS") j.text = j.stopping ? "Stopping…" : (typeof s.output === "string" ? s.output : "Working…");
           else if (s.status === "COMPLETED") {
             j.done = true;
             if (s.output && s.output.error) { j.bad = true; j.text = s.output.error; }
             else {
-              j.text = `Done in ${fmtTime((s.output && s.output.seconds) || 0)}`;
+              j.text = j.fetchId ? "Done (recovered from the volume)" : `Done in ${fmtTime((s.output && s.output.seconds) || 0)}`;
               // In finishing order, without holding up the polling of the other jobs
               const out = s.output || {}, input = { ...j.input, seed: j.seed, jobId: j.id, kind: j.kind, label: j.label };
               results = results.then(() => showResult(out, input)).catch((e) => showStatus(`Couldn't show "${j.label}": ${e.message}`, { error: true }));
@@ -774,7 +809,10 @@ input[type], select, textarea { font-size: 16px; }
         }));
         if (!connected()) break;
         saveQueue(); renderQueue();
-        if (active().length) { await sleep(delay); delay = Math.min(delay + 250, 3000); }
+        if (active().length) {
+          if (checkNow) checkNow = false; else await nap(delay);
+          delay = Math.min(delay + 250, 3000);
+        }
       }
     } finally {
       polling = false; current = null; renderQueue(); pollHealth();
@@ -794,7 +832,7 @@ input[type], select, textarea { font-size: 16px; }
     const targets = active().filter((j) => ids.has(j.id));
     targets.forEach((j) => { j.stopping = true; }); renderQueue();
     // RunPod's cancel ends the job in any state; the worker cancel stops a running generation at its next step
-    await Promise.all(targets.map((j) => api("POST", `/cancel/${j.id}`, null, j.ep || cfg.endpoint).catch(() => {})));
+    await Promise.all(targets.map((j) => api("POST", `/cancel/${j.fetchId || j.id}`, null, j.ep || cfg.endpoint).catch(() => {})));
     // Worker-side cancel only where a worker is actually busy: otherwise it would itself start a GPU worker
     const byEp = {};
     for (const j of targets.filter((j) => j.state === "IN_PROGRESS")) (byEp[j.ep || cfg.endpoint] ||= []).push(j.id);
@@ -832,6 +870,12 @@ input[type], select, textarea { font-size: 16px; }
         showStatus("The next video will start from that one's last frame. Describe what happens next, then Generate.", { progress: 1 });
       });
       if (j.kind === "generate" && !j.bad && j.input.parent) add("Join chain", "Join this clip with the clips it continues from", () => joinChain(j.id));
+      // Lost before the page could recover videos from the volume (or the recovery failed): try again
+      if (j.bad && !j.stopping && (j.kind === "generate" || j.kind === "join") && /^RunPod no longer has this job/.test(j.text))
+        add("Recover", "Get this job's video from the network volume, where the worker keeps it for a week", () => {
+          Object.assign(j, { done: false, bad: false, errs: 0, fetchId: null, text: "Checking…" });
+          saveQueue(); renderQueue(); ensurePolling();
+        });
       if (!j.done) add("×", "Cancel (and anything that depends on it)", () => cancelJobs([j]));
       if (qa.childElementCount) li.append(qa);
       list.append(li);
