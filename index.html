@@ -329,7 +329,7 @@ input[type], select, textarea { font-size: 16px; }
     // without data. Only a stall counts: a finished job's status carries the whole video (several MB of base64),
     // which can take longer than that on a phone, and restarting it from zero on every poll never gets anywhere.
     const ctl = new AbortController();
-    inflight.add(ctl);
+    if (method === "GET") inflight.add(ctl);       // only reads are dropped on resume: a /run may have created its job
     let timer, res, text;
     const arm = () => { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), 20000); };
     try {
@@ -426,6 +426,9 @@ input[type], select, textarea { font-size: 16px; }
 
   // Keyframes: downscaled in the browser so a job stays well under RunPod's 10 MB input limit.
   const frames = { first: null, last: null };
+  // Setting a slot can take a moment (decoding a frame); the newest action on a slot wins, even if an older one
+  // finishes later. Each action takes a ticket, and one that's been overtaken drops its result.
+  const frameTicket = { first: 0, last: 0 };
   const slots = {};                                       // which -> { box, input }
   let lastSlot = "first";                                 // the slot you touched last gets a ⌘V paste
   const LABEL = { first: "First frame", last: "Last frame" };
@@ -435,7 +438,7 @@ input[type], select, textarea { font-size: 16px; }
   let continueAt = null;        // seconds into that clip when the start frame came from the middle of it (Join cuts there)
   function setStartJob(job, preview = null) {
     const { box } = slots.first;
-    frames.first = null; startJob = job;
+    frames.first = null; startJob = job; continueFrom = null; continueAt = null;   // callers set a parent link again if any
     box.innerHTML = (preview ? `<img alt="">` : "") +
                     `<span class="chip${preview ? " over-img" : ""}">↳ ${job.done ? "last frame of" : "after"}:<br><b></b>` +
                     `${job.done ? "" : "<br><small>its last frame, once it's done</small>"}</span>` +
@@ -446,6 +449,7 @@ input[type], select, textarea { font-size: 16px; }
   }
   function emptySlot(which) {
     const { box } = slots[which];
+    frameTicket[which]++;
     frames[which] = null;
     if (which === "first") { startJob = null; continueFrom = null; continueAt = null; }
     box.innerHTML = `<span>${LABEL[which]}<br><small>tap to choose · drop · paste</small></span>` +
@@ -453,14 +457,20 @@ input[type], select, textarea { font-size: 16px; }
     box.querySelector(".paste").onclick = (e) => { e.stopPropagation(); lastSlot = which; pasteFromClipboard(which); };
   }
 
-  async function setFrame(which, blob) {
+  // Returns false (and says why) if the image couldn't be used. A new start frame drops any continuation link;
+  // Continue and "Start from this frame" set theirs again after this.
+  async function setFrame(which, blob, ticket = ++frameTicket[which]) {
     const { box } = slots[which];
-    if (which === "first") startJob = null;
-    try { frames[which] = await shrink(blob, 2048); }
-    catch (e) { showStatus(e.message, { error: true }); return; }
+    let image;
+    try { image = await shrink(blob, 2048); }
+    catch (e) { if (ticket === frameTicket[which]) showStatus(e.message || "Could not read that image.", { error: true }); return false; }
+    if (ticket !== frameTicket[which]) return false;                        // overtaken by a newer action
+    frames[which] = image;
+    if (which === "first") { startJob = null; continueFrom = null; continueAt = null; }
     box.innerHTML = `<img alt=""><button class="x small" type="button" aria-label="Remove">×</button>`;
     box.querySelector("img").src = frames[which];
     box.querySelector(".x").onclick = (e) => { e.stopPropagation(); emptySlot(which); };
+    return true;
   }
 
   // Async clipboard (Paste button): Safari asks with its own "Paste" bubble; Chrome may ask for permission.
@@ -501,7 +511,8 @@ input[type], select, textarea { font-size: 16px; }
     const item = [...(e.clipboardData ? e.clipboardData.items : [])].find((i) => i.type.startsWith("image/"));
     if (!item) return;
     e.preventDefault();
-    const which = !frames[lastSlot] ? lastSlot : !frames.first ? "first" : !frames.last ? "last" : lastSlot;
+    const filled = (w) => !!frames[w] || (w === "first" && !!startJob);    // a continuation fills the start slot
+    const which = !filled(lastSlot) ? lastSlot : !filled("first") ? "first" : !filled("last") ? "last" : lastSlot;
     setFrame(which, item.getAsFile());
   });
 
@@ -603,8 +614,9 @@ input[type], select, textarea { font-size: 16px; }
   }
   // How long the running job has been at it (else how long the oldest queued one has waited)
   setInterval(() => {
-    const open = active(), run = open.find((j) => j.state === "IN_PROGRESS");
-    const t0 = run ? run.runAt || run.t : open.length ? Math.min(...open.map((j) => j.t)) : current && current.started;
+    const open = active(), run = open.find((j) => j.state === "IN_PROGRESS" && j.runAt && /step \d+\/\d+/.test(j.text)) ||
+                                open.find((j) => j.state === "IN_PROGRESS" && j.runAt);
+    const t0 = run ? run.runAt : open.length ? Math.min(...open.map((j) => j.t)) : current && current.started;
     if (t0) $("statusTime").textContent = fmtTime((Date.now() - t0) / 1000);
   }, 500);
   const fmtTime = (s) => s < 60 ? `${Math.floor(s)}s` : `${Math.floor(s / 60)}m ${String(Math.floor(s % 60)).padStart(2, "0")}s`;
@@ -613,14 +625,15 @@ input[type], select, textarea { font-size: 16px; }
 
   async function runJob(kind, input) {
     if (!connected()) { openSettings(); return null; }
-    current = { id: null, kind, started: Date.now(), stopping: false };
+    const mine = current = { id: null, kind, started: Date.now(), stopping: false };
     setBusy(true, kind);
     try {
       const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } });
       current.id = job.id;
       return await follow(job.id);
     } finally {
-      current = null; setBusy(false); pollHealth();
+      if (current === mine) current = null;
+      setBusy(false); pollHealth();
     }
   }
 
@@ -632,11 +645,11 @@ input[type], select, textarea { font-size: 16px; }
       if (s.status === "IN_QUEUE") {
         const w = (health && health.workers) || {};
         const warm = (w.ready || 0) + (w.idle || 0) + (w.running || 0) > 0;
-        showStatus(current.stopping ? "Cancelling…" : warm ? "Queued" : "Waking a GPU worker. A start from sleep takes a few minutes…");
+        showStatus(current && current.stopping ? "Cancelling…" : warm ? "Queued" : "Waking a GPU worker. A start from sleep takes a few minutes…");
       } else if (s.status === "IN_PROGRESS") {
         const text = typeof s.output === "string" ? s.output : "Working…";
         const m = text.match(/step (\d+)\/(\d+)/);
-        showStatus(current.stopping ? "Stopping at the next step…" : text, { progress: m ? Number(m[1]) / Number(m[2]) : null });
+        showStatus(current && current.stopping ? "Stopping at the next step…" : text, { progress: m ? Number(m[1]) / Number(m[2]) : null });
       } else if (s.status === "COMPLETED") {
         if (s.output && s.output.error) throw new Error(s.output.error);
         return s.output || {};
@@ -670,11 +683,14 @@ input[type], select, textarea { font-size: 16px; }
   // The queue: every generation and join sent from this page. They all go to RunPod right away; RunPod queues
   // them and the worker works through them in order (continuations and joins wait for the jobs they need).
   // Generate stays available, so you can keep adding work. Persisted, so a reload reconnects.
-  let queue = (store.get("queue", []) || []).filter((j) => !j.done || Date.now() - (j.t || 0) < 6 * 3600e3);
+  let queue = (store.get("queue", []) || []).filter((j) => !j.done || j.delivered === false || Date.now() - (j.t || 0) < 6 * 3600e3);
+  // A result that finished but never reached History (the app was closed mid-download): pick it up again
+  for (const j of queue) if (j.done && j.delivered === false)
+    Object.assign(j, { done: false, bad: false, fetchId: null, recover: true, text: "Picking up the finished video…" });
   let polling = false;
   const active = () => queue.filter((j) => !j.done);
-  function saveQueue() { store.set("queue", queue.slice(-40).map(({ id, ep, kind, label, seed, input, state, text, done, bad, t }) =>
-                                                         ({ id, ep, kind, label, seed, input, state, text, done, bad, t }))); }
+  function saveQueue() { store.set("queue", queue.slice(-40).map(({ id, ep, kind, label, seed, input, state, text, done, bad, t, fetchId, runAt, delivered, recover }) =>
+                                                         ({ id, ep, kind, label, seed, input, state, text, done, bad, t, fetchId, runAt, delivered, recover }))); }
 
   async function submit(kind, input, label, seedValue) {
     const ep = engineEp();
@@ -759,8 +775,14 @@ input[type], select, textarea { font-size: 16px; }
 
   function ensurePolling() { if (!polling && active().length) pollQueue(); }
   let results = Promise.resolve();
+  // Ask a worker for a finished job's video from the volume (RunPod forgot or rejected the result, or Recover)
+  async function startFetch(j) {
+    const f = await api("POST", "/run", { input: { action: "fetch", job: j.id, api_key: cfg.h3Key } }, j.ep || cfg.endpoint);
+    Object.assign(j, { fetchId: f.id, recover: false, errs: 0, state: "IN_QUEUE", runAt: null, t: Date.now(), text: "Getting the finished video from the volume…" });
+  }
   async function pollQueue() {
-    polling = true; current = current || { started: Date.now() };
+    polling = true;
+    const mine = current ? null : (current = { started: Date.now() });
     let delay = 1500;
     try {
       while (active().length && connected()) {          // stops while locked; unlocking restarts it
@@ -773,10 +795,7 @@ input[type], select, textarea { font-size: 16px; }
             // RunPod forgets a finished job's result after a while (e.g. while the app was in the background), but
             // the worker keeps every video on the volume for a week: ask a worker for it instead of giving up.
             if (e.status === 404 && !j.stopping && !j.fetchId && (j.kind === "generate" || j.kind === "join")) {
-              try {
-                const f = await api("POST", "/run", { input: { action: "fetch", job: j.id, api_key: cfg.h3Key } }, j.ep || cfg.endpoint);
-                Object.assign(j, { fetchId: f.id, errs: 0, state: "IN_QUEUE", runAt: null, text: "Getting the finished video from the volume…" });
-              } catch (e2) { if (!e2.resumed) j.text = `${e2.message} (retrying)`; }
+              try { await startFetch(j); } catch (e2) { if (!e2.resumed) j.text = `${e2.message} (retrying)`; }
               return;
             }
             // RunPod forgets finished jobs after a while, and a lost job never comes back: end it here
@@ -789,18 +808,24 @@ input[type], select, textarea { font-size: 16px; }
             return;
           }
           j.errs = 0; j.state = s.status;
-          if (s.status === "IN_PROGRESS" && !j.runAt) j.runAt = Date.now();
+          if (j.recover && !j.fetchId && (["FAILED", "TIMED_OUT"].includes(s.status) || (s.status === "COMPLETED" && s.output && s.output.error))) {
+            try { await startFetch(j); } catch (e2) { if (!e2.resumed) j.text = `${e2.message} (retrying)`; }
+            return;
+          }
+          // the timer starts when this job's generation does, not while it waits behind another on the worker
+          if (s.status === "IN_PROGRESS" && !j.runAt && !/^Waiting/.test(typeof s.output === "string" ? s.output : "")) j.runAt = Date.now();
           if (j.fetchId && (s.status === "IN_QUEUE" || s.status === "IN_PROGRESS")) j.text = "Getting the finished video from the volume…";
           else if (s.status === "IN_QUEUE") j.text = j.stopping ? "Cancelling…" : "Queued";
           else if (s.status === "IN_PROGRESS") j.text = j.stopping ? "Stopping…" : (typeof s.output === "string" ? s.output : "Working…");
           else if (s.status === "COMPLETED") {
-            j.done = true;
+            j.done = true; j.recover = false;
             if (s.output && s.output.error) { j.bad = true; j.text = s.output.error; }
             else {
               j.text = j.fetchId ? "Done (recovered from the volume)" : `Done in ${fmtTime((s.output && s.output.seconds) || 0)}`;
               // In finishing order, without holding up the polling of the other jobs
               const out = s.output || {}, input = { ...j.input, seed: j.seed, jobId: j.id, kind: j.kind, label: j.label, ep: j.ep || cfg.endpoint };
-              results = results.then(() => showResult(out, input)).catch((e) => {
+              j.delivered = false;                       // until it's in History (survives the app closing)
+              results = results.then(() => showResult(out, input)).then(() => { j.delivered = true; saveQueue(); }).catch((e) => {
                 Object.assign(j, { bad: true, text: `Couldn't download the video: ${e.message}` });   // Recover tries again
                 saveQueue(); renderQueue(); showStatus(`Couldn't show "${j.label}": ${e.message}`, { error: true });
               });
@@ -818,7 +843,8 @@ input[type], select, textarea { font-size: 16px; }
         }
       }
     } finally {
-      polling = false; current = null; renderQueue(); pollHealth();
+      polling = false; if (mine && current === mine) current = null;
+      renderQueue(); pollHealth();
     }
   }
 
@@ -853,7 +879,7 @@ input[type], select, textarea { font-size: 16px; }
     }, 20000);
   }
   $("stopBtn").onclick = () => cancelJobs(active());
-  $("clearDone").onclick = () => { queue = queue.filter((j) => !j.done); saveQueue(); renderQueue(); };
+  $("clearDone").onclick = () => { queue = queue.filter((j) => !j.done || j.delivered === false); saveQueue(); renderQueue(); };
 
   function renderQueue() {
     const list = $("batch"), open = active();
@@ -868,7 +894,7 @@ input[type], select, textarea { font-size: 16px; }
       const qa = document.createElement("span"); qa.className = "qa";
       const add = (text, title, fn) => { const b = document.createElement("button"); b.className = "small"; b.textContent = text; b.title = title; b.onclick = fn; qa.append(b); };
       if (j.kind === "generate" && !j.bad) add("Continue after", "Start the next video from this one's last frame, once it's done", () => {
-        setStartJob({ id: j.id, label: j.label });
+        frameTicket.first++; setStartJob({ id: j.id, label: j.label });
         const box = $("prompt"); box.scrollIntoView({ behavior: "smooth", block: "center" }); box.focus({ preventScroll: true });
         showStatus("The next video will start from that one's last frame. Describe what happens next, then Generate.", { progress: 1 });
       });
@@ -876,12 +902,9 @@ input[type], select, textarea { font-size: 16px; }
       // A failed or lost clip may well be on the volume anyway: the worker stores every video before returning it
       // (a result RunPod rejected, one it forgot, a download that broke off). Recover asks for it; the worker says if not.
       if (j.bad && !j.stopping && (j.kind === "generate" || j.kind === "join") && !/cancel|stopped/i.test(j.text))
-        add("Recover", "Get this job's video from the network volume, where the worker keeps it for a week", async () => {
-          try {
-            const f = await api("POST", "/run", { input: { action: "fetch", job: j.id, api_key: cfg.h3Key } }, j.ep || cfg.endpoint);
-            Object.assign(j, { done: false, bad: false, errs: 0, fetchId: f.id, state: "IN_QUEUE", runAt: null, text: "Getting the finished video from the volume…" });
-            saveQueue(); renderQueue(); ensurePolling();
-          } catch (e) { showStatus(e.message, { error: true }); }
+        add("Recover", "Get this job's video: from RunPod if it's still there, else from the network volume (kept a week)", () => {
+          Object.assign(j, { done: false, bad: false, errs: 0, fetchId: null, recover: true, runAt: null, t: Date.now(), text: "Checking…" });
+          saveQueue(); renderQueue(); ensurePolling();
         });
       if (!j.done) add("×", "Cancel (and anything that depends on it)", () => cancelJobs([j]));
       if (qa.childElementCount) li.append(qa);
@@ -912,9 +935,12 @@ input[type], select, textarea { font-size: 16px; }
     return bytes;
   };
   // One worker job from start to finish (the chunks of a stored video)
+  const whenUnlocked = async () => { while (!connected()) await sleep(1000); };   // locked: keys are gone until unlock
   async function runOnWorker(ep, input) {
+    await whenUnlocked();
     const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } }, ep);
     for (let delay = 800; ; delay = Math.min(delay + 250, 2000)) {
+      await whenUnlocked();
       let s;
       try { s = await api("GET", `/status/${job.id}`, null, ep); } catch (e) { if (e.resumed) continue; throw e; }
       if (s.status === "COMPLETED") { if (s.output && s.output.error) throw new Error(s.output.error); return s.output || {}; }
@@ -936,7 +962,9 @@ input[type], select, textarea { font-size: 16px; }
     return new Blob(parts, { type: "video/mp4" });
   }
 
+  let wipes = 0;                // "Forgot PIN" wipes: a result still on its way is dropped
   async function showResult(out, input) {
+    const epoch = wipes;
     let blob;
     if (out.video_b64) {
       blob = new Blob([b64Bytes(out.video_b64)], { type: "video/mp4" });
@@ -945,6 +973,8 @@ input[type], select, textarea { font-size: 16px; }
     } else if (out.video_url) {
       try { blob = await (await fetch(out.video_url)).blob(); } catch { blob = null; }
     }
+    await whenUnlocked();             // nothing plays or lands in History behind the lock screen
+    if (epoch !== wipes) return;
     const entry = { id: Date.now(), created: new Date().toISOString(),
                     prompt: input.kind === "join" ? (input.label || "Joined clips") : (input.prompt || "(resumed job)"),
                     jobId: input.jobId || null, parentJob: input.parent || null, parentAt: input.parent_at ?? null, kind: input.kind || "generate",
@@ -959,6 +989,10 @@ input[type], select, textarea { font-size: 16px; }
   }
   let autoShown = false;
   const pending = [];
+  function dropPending(entry) {          // by id: History hands over fresh copies of its entries
+    const i = pending.findIndex((p) => p.id === entry.id);
+    if (i >= 0) { pending.splice(i, 1); showNext(); }
+  }
   function showNext() {
     const b = $("nextBtn");
     b.classList.toggle("hidden", !pending.length);
@@ -1009,7 +1043,7 @@ input[type], select, textarea { font-size: 16px; }
   let objectUrl = null, stageEntry = null;
   function play(entry, fromTap = false) {
     stageEntry = entry;
-    const i = pending.indexOf(entry); if (i >= 0) { pending.splice(i, 1); showNext(); }
+    dropPending(entry);
     if (objectUrl) URL.revokeObjectURL(objectUrl);
     const src = entry.blob ? (objectUrl = URL.createObjectURL(entry.blob)) : entry.url;
     $("stage").innerHTML = "";
@@ -1059,14 +1093,16 @@ input[type], select, textarea { font-size: 16px; }
       cont.title = "Start the next video from this one's last frame; then write what happens next";
       cont.onclick = async () => {
         cont.disabled = true;
+        const ticket = ++frameTicket.first;
         try {
           const stored = entry.jobId && Date.now() - new Date(entry.created).getTime() < 6 * 86400e3;
           if (stored) {
             let preview = null;
             try { preview = (await grabFrame(entry.blob, "last", 480)).toDataURL("image/jpeg", 0.85); } catch {}
+            if (ticket !== frameTicket.first) return;                         // overtaken by a newer action
             setStartJob({ id: entry.jobId, label: entry.prompt, done: true }, preview);
           } else {
-            await setFrame("first", await canvasBlob(await grabFrame(entry.blob, "last")));
+            if (!(await setFrame("first", await canvasBlob(await grabFrame(entry.blob, "last")), ticket))) return;
           }
           emptySlot("last");
           if (entry.canvas && [...canvasSel.options].some((o) => o.value === entry.canvas)) { canvasSel.value = entry.canvas; store.set("canvas", entry.canvas); }
@@ -1100,8 +1136,9 @@ input[type], select, textarea { font-size: 16px; }
         b.title = `Put this video's ${from} frame in the ${to === "first" ? "First frame (start)" : "Last frame (end)"} slot`;
         b.onclick = async () => {
           b.disabled = true;
+          const ticket = ++frameTicket[to];
           try {
-            await setFrame(to, await canvasBlob(await grabFrame(entry.blob, from)));
+            if (!(await setFrame(to, await canvasBlob(await grabFrame(entry.blob, from)), ticket))) return;
             showStatus(`${from === "last" ? "Last" : "First"} frame set as the ${to === "first" ? "start" : "end"} keyframe.`, { progress: 1 });
             $(to === "first" ? "firstFrame" : "lastFrame").scrollIntoView({ behavior: "smooth", block: "center" });
           } catch (e) { showStatus(e.message, { error: true }); }
@@ -1117,7 +1154,7 @@ input[type], select, textarea { font-size: 16px; }
     }
     if (entry.id && entry.blob) {
       const del = document.createElement("button"); del.className = "small"; del.textContent = "Delete";
-      del.onclick = async () => { await db.del(entry.id); renderHistory(); $("stage").innerHTML = '<div class="empty">Deleted.</div>'; acts.classList.add("hidden"); $("report").textContent = ""; };
+      del.onclick = async () => { await db.del(entry.id); dropPending(entry); renderHistory(); $("stage").innerHTML = '<div class="empty">Deleted.</div>'; acts.classList.add("hidden"); $("report").textContent = ""; };
       acts.append(del);
     }
   }
@@ -1125,11 +1162,16 @@ input[type], select, textarea { font-size: 16px; }
   // is read from the middle of its interval (robust to seek rounding), and a Join cuts the source clip at its start.
   async function useFrameHere(v, entry, to, btn, atLastFrame = null) {
     v.pause();
-    const fps = 24, n = Math.floor(v.currentTime * fps + 1e-3), total = Math.round((v.duration || 0) * fps);
+    // The worker's report gives the real frame count (the audio track can run a little past the last frame)
+    const fps = 24, reported = Number(((entry.report || "").match(/(\d+) frames/) || [])[1]) || 0;
+    const total = reported || Math.round((v.duration || 0) * fps);
+    let n = Math.floor(v.currentTime * fps + 0.05);                       // tolerate times rounded to the millisecond
+    if (total) n = Math.min(n, total - 1);
     if (atLastFrame && total && n >= total - 1) { atLastFrame(); return; }   // on the last frame it's a plain Continue
     btn.disabled = true;
+    const ticket = ++frameTicket[to];
     try {
-      await setFrame(to, await canvasBlob(await grabFrame(entry.blob, (n + 0.5) / fps)));
+      if (!(await setFrame(to, await canvasBlob(await grabFrame(entry.blob, (n + 0.5) / fps)), ticket))) return;
       const at = `${(n / fps).toFixed(2)} s`;
       if (to === "first") {
         emptySlot("last");
@@ -1169,6 +1211,7 @@ input[type], select, textarea { font-size: 16px; }
       all: async () => ((await tx("readonly", (s) => s.getAll())) || []).sort((a, b) => b.id - a.id),
       put: async (e) => { await tx("readwrite", (s) => s.put(e)); const all = await db.all(); for (const old of all.slice(40)) await db.del(old.id); },
       del: (id) => tx("readwrite", (s) => s.delete(id)),
+      get: (id) => tx("readonly", (s) => s.get(id)),
     };
   })();
 
@@ -1222,7 +1265,7 @@ input[type], select, textarea { font-size: 16px; }
         if (thumbTried.has(e.id)) continue;
         thumbTried.add(e.id);
         e.thumb = await makeThumb(e.blob);
-        if (e.thumb) {
+        if (e.thumb && await db.get(e.id)) {          // still there: it may have been deleted meanwhile
           img.src = e.thumb; await db.put(e);
           const v = $("stage").querySelector("video");
           if (v && stageEntry && stageEntry.id === e.id && !v.poster) v.poster = e.thumb;        // iPhone shows black until playback otherwise
@@ -1343,6 +1386,7 @@ input[type], select, textarea { font-size: 16px; }
   $("pinForgot").onclick = async () => {
     if (!confirm("Reset the PIN? This deletes the saved keys AND the video History on this device, so the lock can't be bypassed. You'll set a new PIN and re-enter your keys.")) return;
     for (const k of ["pin", "pinFails", "cfgSealed", "cfg", "queue"]) store.del(k);
+    queue = []; wipes++;
     try { const all = await db.all(); for (const e of all) await db.del(e.id); } catch {}
     lockNow();
   };
