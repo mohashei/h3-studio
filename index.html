@@ -799,8 +799,11 @@ input[type], select, textarea { font-size: 16px; }
             else {
               j.text = j.fetchId ? "Done (recovered from the volume)" : `Done in ${fmtTime((s.output && s.output.seconds) || 0)}`;
               // In finishing order, without holding up the polling of the other jobs
-              const out = s.output || {}, input = { ...j.input, seed: j.seed, jobId: j.id, kind: j.kind, label: j.label };
-              results = results.then(() => showResult(out, input)).catch((e) => showStatus(`Couldn't show "${j.label}": ${e.message}`, { error: true }));
+              const out = s.output || {}, input = { ...j.input, seed: j.seed, jobId: j.id, kind: j.kind, label: j.label, ep: j.ep || cfg.endpoint };
+              results = results.then(() => showResult(out, input)).catch((e) => {
+                Object.assign(j, { bad: true, text: `Couldn't download the video: ${e.message}` });   // Recover tries again
+                saveQueue(); renderQueue(); showStatus(`Couldn't show "${j.label}": ${e.message}`, { error: true });
+              });
             }
           } else {
             j.done = true; j.bad = true;
@@ -870,11 +873,15 @@ input[type], select, textarea { font-size: 16px; }
         showStatus("The next video will start from that one's last frame. Describe what happens next, then Generate.", { progress: 1 });
       });
       if (j.kind === "generate" && !j.bad && j.input.parent) add("Join chain", "Join this clip with the clips it continues from", () => joinChain(j.id));
-      // Lost before the page could recover videos from the volume (or the recovery failed): try again
-      if (j.bad && !j.stopping && (j.kind === "generate" || j.kind === "join") && /^RunPod no longer has this job/.test(j.text))
-        add("Recover", "Get this job's video from the network volume, where the worker keeps it for a week", () => {
-          Object.assign(j, { done: false, bad: false, errs: 0, fetchId: null, text: "Checking…" });
-          saveQueue(); renderQueue(); ensurePolling();
+      // A failed or lost clip may well be on the volume anyway: the worker stores every video before returning it
+      // (a result RunPod rejected, one it forgot, a download that broke off). Recover asks for it; the worker says if not.
+      if (j.bad && !j.stopping && (j.kind === "generate" || j.kind === "join") && !/cancel|stopped/i.test(j.text))
+        add("Recover", "Get this job's video from the network volume, where the worker keeps it for a week", async () => {
+          try {
+            const f = await api("POST", "/run", { input: { action: "fetch", job: j.id, api_key: cfg.h3Key } }, j.ep || cfg.endpoint);
+            Object.assign(j, { done: false, bad: false, errs: 0, fetchId: f.id, state: "IN_QUEUE", runAt: null, text: "Getting the finished video from the volume…" });
+            saveQueue(); renderQueue(); ensurePolling();
+          } catch (e) { showStatus(e.message, { error: true }); }
         });
       if (!j.done) add("×", "Cancel (and anything that depends on it)", () => cancelJobs([j]));
       if (qa.childElementCount) li.append(qa);
@@ -899,12 +906,42 @@ input[type], select, textarea { font-size: 16px; }
   store.del("currentJob");
 
   // ---------------------------------------------------------------- results + history (IndexedDB, optional)
+  const b64Bytes = (b64) => {
+    const bin = atob(b64), bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  };
+  // One worker job from start to finish (the chunks of a stored video)
+  async function runOnWorker(ep, input) {
+    const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } }, ep);
+    for (let delay = 800; ; delay = Math.min(delay + 250, 2000)) {
+      let s;
+      try { s = await api("GET", `/status/${job.id}`, null, ep); } catch (e) { if (e.resumed) continue; throw e; }
+      if (s.status === "COMPLETED") { if (s.output && s.output.error) throw new Error(s.output.error); return s.output || {}; }
+      if (["FAILED", "CANCELLED", "TIMED_OUT"].includes(s.status)) throw new Error(parseError(s));
+      await sleep(delay);
+    }
+  }
+  // A video too big for a job's result (RunPod caps it at 10 MB) stays on the volume: download it in chunks.
+  async function downloadStored(out, ep, label) {
+    const parts = [], step = out.chunk_bytes || 6 * 1024 * 1024, n = Math.ceil(out.size / step);
+    for (let off = 0, i = 1; off < out.size; off += step, i++) {
+      showStatus(`Downloading "${label}" (part ${i} of ${n})…`, { progress: (i - 1) / n });
+      for (let attempt = 1; ; attempt++) {
+        try { parts.push(b64Bytes((await runOnWorker(ep, { action: "fetch", job: out.job, offset: off, length: step })).chunk_b64)); break; }
+        catch (e) { if (attempt >= 3) throw e; await sleep(2000); }
+      }
+    }
+    showStatus(`Downloaded "${label}".`, { progress: 1 });
+    return new Blob(parts, { type: "video/mp4" });
+  }
+
   async function showResult(out, input) {
     let blob;
     if (out.video_b64) {
-      const bin = atob(out.video_b64), bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      blob = new Blob([bytes], { type: "video/mp4" });
+      blob = new Blob([b64Bytes(out.video_b64)], { type: "video/mp4" });
+    } else if (out.stored) {
+      blob = await downloadStored(out, input.ep, input.label || "video");
     } else if (out.video_url) {
       try { blob = await (await fetch(out.video_url)).blob(); } catch { blob = null; }
     }
