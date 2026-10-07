@@ -328,7 +328,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "90ec710 2026-10-07 04:43Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "3b51b15 2026-10-07 06:00Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -343,13 +343,14 @@ input[type], select, textarea { font-size: 16px; }
   const inflight = new Set();   // AbortControllers of requests in flight (dropped on a return from the background)
   // opts: stall (ms without data before giving up), droppable (may be dropped on a return from the background;
   // default: reads only), meta (filled with the reply's size and how long its body took to arrive)
-  const api = async (method, path, body, ep = engineEp(), { stall = 20000, droppable = method === "GET", meta = null } = {}) => {
+  const api = async (method, path, body, ep = engineEp(), { stall = 20000, droppable = method === "GET", meta = null, stop = null } = {}) => {
     const base = store.get("apiBase", "https://api.runpod.ai");   // override exists only for local testing
     // iPhone Safari can leave a request hanging forever after the app was in the background: give up after 20 s
     // without data. Only a stall counts: a finished job's status carries the whole video (several MB of base64),
     // which can take longer than that on a phone, and restarting it from zero on every poll never gets anywhere.
     const ctl = new AbortController();
     if (droppable) inflight.add(ctl);              // not a /run that may already have created its job
+    if (stop) { if (stop.done) throw Object.assign(new Error("superseded"), { superseded: true }); stop.abort = () => ctl.abort(); }
     let timer, res, text, bodyAt;
     const t0 = performance.now(), what = `${method} ${path.replace(/\?.*$/, "")} @${String(ep).slice(0, 6)}`, quiet = path === "/health";
     const arm = () => { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), stall); };
@@ -367,6 +368,7 @@ input[type], select, textarea { font-size: 16px; }
       } else text = await res.text();
       if (meta) Object.assign(meta, { bytes: text.length, bodyMs: performance.now() - bodyAt });
     } catch (e) {
+      if (stop && stop.done) throw Object.assign(new Error("superseded"), { superseded: true });
       dbg(`${what} ✗ ${ctl.resumed ? "dropped (back from background)" : e.name === "AbortError" ? `no data for ${stall / 1000} s` : e.message} after ${Math.round(performance.now() - t0)} ms`);
       if (ctl.resumed) { const r = new Error("Interrupted while the app was in the background; try again."); r.resumed = true; throw r; }
       throw new Error(e.name === "AbortError" ? "RunPod didn't answer in time." : "Can't reach RunPod (offline?).");
@@ -970,16 +972,17 @@ input[type], select, textarea { font-size: 16px; }
   // One quick, repeatable worker job (a chunk of a stored video). /runsync returns the result in the same request
   // (RunPod holds it open up to ~90 s); if the job takes longer, e.g. while a worker starts, poll its status.
   // `stats` gets how long RunPod queued it, how long it ran, and how long its data took to arrive.
-  async function runOnWorker(ep, input, stats = null) {
+  async function runOnWorker(ep, input, stats = null, stop = null) {
     for (;;) {
       await whenUnlocked();
       const meta = {};
       let s;
-      try { s = await api("POST", "/runsync", { input: { ...input, api_key: cfg.h3Key } }, ep, { stall: 120000, droppable: true, meta }); }
+      // RunPod answers within 20 s either way: with the result, or with the job still queued/running (then poll)
+      try { s = await api("POST", "/runsync?wait=20000", { input: { ...input, api_key: cfg.h3Key } }, ep, { stall: 40000, droppable: true, meta, stop }); }
       catch (e) { if (e.resumed) continue; throw e; }                      // repeatable: just ask again
       for (let delay = 800; s.status === "IN_QUEUE" || s.status === "IN_PROGRESS"; delay = Math.min(delay + 250, 2000)) {
         await sleep(delay); await whenUnlocked();
-        try { s = await api("GET", `/status/${s.id}`, null, ep, { meta }); } catch (e) { if (!e.resumed) throw e; }
+        try { s = await api("GET", `/status/${s.id}`, null, ep, { meta, stop }); } catch (e) { if (!e.resumed) throw e; }
       }
       if (stats) stats.push({ ok: s.status === "COMPLETED" && !(s.output && s.output.error), wait: (s.delayTime || 0) / 1000, run: (s.executionTime || 0) / 1000, bytes: meta.bytes || 0, transfer: (meta.bodyMs || 0) / 1000 });
       if (s.status === "COMPLETED") { if (s.output && s.output.error) throw new Error(s.output.error); return s.output || {}; }
@@ -987,35 +990,39 @@ input[type], select, textarea { font-size: 16px; }
     }
   }
   // One piece of a stored video, hedged: RunPod sometimes never receives a worker's result (the upload hangs), so a
-  // piece that isn't back in 12 s is asked for again, up to 3 copies in flight; the first to arrive wins. Fetching a
-  // piece twice is harmless.
+  // piece that isn't back in 6 s (they normally take about a second) is asked for again, up to 3 copies in flight;
+  // the first to arrive wins. Fetching a piece twice is harmless.
   function fetchPiece(ep, input, stats, label) {
     return new Promise((resolve, reject) => {
       let launched = 0, failed = 0, settled = false, timer = null, lastError = null;
+      const stops = [];
+      const finish = () => { settled = true; clearTimeout(timer); for (const st of stops) { st.done = true; if (st.abort) st.abort(); } };
       const launch = () => {
         clearTimeout(timer);
         if (settled || launched >= 3) return;
-        const n = ++launched;
+        const n = ++launched, stop = {};
+        stops.push(stop);
         if (n > 1) dbg(`${label}: no answer yet, asking again (copy ${n})`);
-        runOnWorker(ep, input, stats).then((out) => {
-          if (!settled) { settled = true; clearTimeout(timer); resolve(out); }
+        runOnWorker(ep, input, stats, stop).then((out) => {
+          if (!settled) { finish(); resolve(out); }
         }, (e) => {
+          if (e.superseded) return;
           failed++; lastError = e;
           if (settled) return;
-          if (failed >= 3) { settled = true; clearTimeout(timer); reject(e); }
+          if (failed >= 3) { finish(); reject(e); }
           else if (launched === failed) launch();          // nothing else in flight: retry now
         });
-        if (launched < 3) timer = setTimeout(launch, 12000);
+        if (launched < 3) timer = setTimeout(launch, 6000);
       };
       launch();
     });
   }
   // A video too big for a job's result (RunPod caps it at 10 MB) stays on the volume: download it in chunks.
   async function downloadStored(out, ep, label, stats) {
-    const step = out.chunk_bytes || 3.5 * 1024 * 1024, n = Math.ceil(out.size / step), parts = new Array(n);
+    const step = out.chunk_bytes || 512 * 1024, n = Math.ceil(out.size / step), parts = new Array(n);
     let next = 0, done = 0, failed = null;
     showStatus(`Downloading "${label}" (0 of ${n} parts)…`, { progress: 0 });
-    const lane = async () => {                         // two lanes: two parts in flight at a time
+    const lane = async () => {                         // three lanes: three parts in flight at a time
       while (next < n && !failed) {
         const i = next++;
         try { parts[i] = b64Bytes((await fetchPiece(ep, { action: "fetch", job: out.job, offset: i * step, length: step }, stats, `${label} part ${i + 1} of ${n}`)).chunk_b64); }
@@ -1024,7 +1031,7 @@ input[type], select, textarea { font-size: 16px; }
         showStatus(`Downloading "${label}" (${done} of ${n} parts)…`, { progress: done / n });
       }
     };
-    await Promise.all([lane(), lane()]);
+    await Promise.all([lane(), lane(), lane()]);
     showStatus(`Downloaded "${label}".`, { progress: 1 });
     return new Blob(parts, { type: "video/mp4" });
   }
