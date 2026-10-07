@@ -328,7 +328,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "34c5597 2026-10-07 04:04Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "90ec710 2026-10-07 04:43Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -986,6 +986,30 @@ input[type], select, textarea { font-size: 16px; }
       throw new Error(parseError(s));
     }
   }
+  // One piece of a stored video, hedged: RunPod sometimes never receives a worker's result (the upload hangs), so a
+  // piece that isn't back in 12 s is asked for again, up to 3 copies in flight; the first to arrive wins. Fetching a
+  // piece twice is harmless.
+  function fetchPiece(ep, input, stats, label) {
+    return new Promise((resolve, reject) => {
+      let launched = 0, failed = 0, settled = false, timer = null, lastError = null;
+      const launch = () => {
+        clearTimeout(timer);
+        if (settled || launched >= 3) return;
+        const n = ++launched;
+        if (n > 1) dbg(`${label}: no answer yet, asking again (copy ${n})`);
+        runOnWorker(ep, input, stats).then((out) => {
+          if (!settled) { settled = true; clearTimeout(timer); resolve(out); }
+        }, (e) => {
+          failed++; lastError = e;
+          if (settled) return;
+          if (failed >= 3) { settled = true; clearTimeout(timer); reject(e); }
+          else if (launched === failed) launch();          // nothing else in flight: retry now
+        });
+        if (launched < 3) timer = setTimeout(launch, 12000);
+      };
+      launch();
+    });
+  }
   // A video too big for a job's result (RunPod caps it at 10 MB) stays on the volume: download it in chunks.
   async function downloadStored(out, ep, label, stats) {
     const step = out.chunk_bytes || 3.5 * 1024 * 1024, n = Math.ceil(out.size / step), parts = new Array(n);
@@ -994,14 +1018,8 @@ input[type], select, textarea { font-size: 16px; }
     const lane = async () => {                         // two lanes: two parts in flight at a time
       while (next < n && !failed) {
         const i = next++;
-        for (let attempt = 1; ; attempt++) {
-          try { parts[i] = b64Bytes((await runOnWorker(ep, { action: "fetch", job: out.job, offset: i * step, length: step }, stats)).chunk_b64); break; }
-          catch (e) {
-            dbg(`${label}: part ${i + 1} of ${n}, attempt ${attempt} failed: ${e.message}`);
-            if (attempt >= 3 || failed) { failed = failed || e; throw failed; }
-            await sleep(2000);
-          }
-        }
+        try { parts[i] = b64Bytes((await fetchPiece(ep, { action: "fetch", job: out.job, offset: i * step, length: step }, stats, `${label} part ${i + 1} of ${n}`)).chunk_b64); }
+        catch (e) { dbg(`${label}: part ${i + 1} of ${n} failed: ${e.message}`); failed = failed || e; throw failed; }
         done++;
         showStatus(`Downloading "${label}" (${done} of ${n} parts)…`, { progress: done / n });
       }
