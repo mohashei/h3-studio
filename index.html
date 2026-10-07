@@ -328,7 +328,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "3b51b15 2026-10-07 06:00Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "9815f53 2026-10-07 15:05Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -1035,6 +1035,24 @@ input[type], select, textarea { font-size: 16px; }
     showStatus(`Downloaded "${label}".`, { progress: 1 });
     return new Blob(parts, { type: "video/mp4" });
   }
+  // A finished video straight from the bucket, by a signed link that works for an hour. Gives up after 20 s without
+  // data, or if the size doesn't match; the caller then falls back to chunks from the volume.
+  async function downloadLink(url, expected) {
+    const ctl = new AbortController();
+    let timer;
+    const arm = () => { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), 20000); };
+    try {
+      arm();
+      const res = await fetch(url, { signal: ctl.signal });
+      if (!res.ok) throw new Error(`storage answered ${res.status}`);
+      const reader = res.body.getReader(), parts = [];
+      let got = 0;
+      for (;;) { arm(); const { done, value } = await reader.read(); if (done) break; parts.push(value); got += value.length; }
+      if (expected && got !== expected) throw new Error(`got ${got} of ${expected} bytes`);
+      return new Blob(parts, { type: "video/mp4" });
+    } catch (e) { throw new Error(e.name === "AbortError" ? "storage stopped sending" : e.message || "storage unreachable"); }
+    finally { clearTimeout(timer); }
+  }
   // "downloaded 5.1 MB in 34 s (2 parts; waited up to 28 s for a worker; 6 s transferring)", for the queue entry
   function downloadSummary(bytes, seconds, stats, inline) {
     const s = (x) => (x < 10 ? x.toFixed(1) : Math.round(x)) + " s", mb = (bytes / 1e6).toFixed(1) + " MB";
@@ -1048,15 +1066,25 @@ input[type], select, textarea { font-size: 16px; }
   async function showResult(out, input) {
     const epoch = wipes, started = performance.now(), stats = [];
     let blob, summary = "";
+    const label = input.label || "video", secs = () => (performance.now() - started) / 1000;
     if (out.video_b64) {
       blob = new Blob([b64Bytes(out.video_b64)], { type: "video/mp4" });
       const dl = input.dl || {};                       // it came with the status reply that said "done"
       summary = downloadSummary(blob.size, (dl.bodyMs || 0) / 1000, [], true);
+    } else if (out.video_url) {
+      try {
+        blob = await downloadLink(out.video_url, out.size);
+        const t = secs();
+        summary = `downloaded ${(blob.size / 1e6).toFixed(1)} MB in ${t < 10 ? t.toFixed(1) : Math.round(t)} s (direct from storage)`;
+      } catch (e) {
+        dbg(`${label}: storage link failed (${e.message})${out.stored ? ", using the volume instead" : ""}`);
+        if (!out.stored) throw e;
+        blob = await downloadStored(out, input.ep, label, stats);
+        summary = downloadSummary(out.size, secs(), stats, false) + " — storage link failed";
+      }
     } else if (out.stored) {
       blob = await downloadStored(out, input.ep, input.label || "video", stats);
       summary = downloadSummary(out.size, (performance.now() - started) / 1000, stats, false);
-    } else if (out.video_url) {
-      try { blob = await (await fetch(out.video_url)).blob(); } catch { blob = null; }
     }
     await whenUnlocked();             // nothing plays or lands in History behind the lock screen
     if (epoch !== wipes) return;
@@ -1065,7 +1093,7 @@ input[type], select, textarea { font-size: 16px; }
                     jobId: input.jobId || null, parentJob: input.parent || null, parentAt: input.parent_at ?? null, kind: input.kind || "generate",
                     engine: input.engine || "ultra", preset: input.preset || "", canvas: input.canvas || "", duration: input.duration, seed: out.seed ?? input.seed,
                     lora: input.lora ? { link: loraUrl.value.trim(), strength: input.lora.strength, steps: input.lora.steps } : null,
-                    report: out.report || "", blob, url: out.video_url || null };
+                    report: out.report || "", blob, url: null };     // signed links expire within the hour
     // The first result since you last queued something plays; later ones wait behind "Next" so a clip you're
     // watching isn't replaced seconds later. The thumbnail is made by History afterwards, not on the way in.
     if (!autoShown || !$("stage").querySelector("video")) { autoShown = true; play(entry); }
