@@ -265,6 +265,12 @@ input[type], select, textarea { font-size: 16px; }
     <label for="cfgCivitai">Civitai API token (optional)</label>
     <input type="password" id="cfgCivitai" autocomplete="off" placeholder="Only needed for LoRAs Civitai won't serve anonymously">
     <label class="check"><input type="checkbox" id="cfgRemember" checked> Remember on this computer</label>
+    <details class="frame-actions" id="debugBox">
+      <summary>Debug</summary>
+      <p class="hint" style="margin:6px 0">Page version <b id="buildId"></b>. The log lists every RunPod request (no keys) and what happened to each result.</p>
+      <div class="frame-row"><button type="button" class="small" id="copyLog">Copy debug log</button><button type="button" class="small" id="clearLog">Clear</button></div>
+      <pre id="debugView" style="max-height:220px;overflow:auto;font-size:11px;white-space:pre-wrap;margin:8px 0 0"></pre>
+    </details>
     <div class="actions">
       <button type="button" id="forgetBtn">Forget keys</button>
       <button class="primary" value="save">Save</button>
@@ -322,6 +328,18 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
+  const BUILD = "34c5597 2026-10-07 04:04Z";                        // replaced by scripts/publish_web.sh
+  const debugLog = store.get("debugLog", []);
+  let debugSave = null;
+  function dbg(msg) {
+    const line = `${new Date().toISOString().slice(11, 23)} ${msg}`;
+    debugLog.push(line); if (debugLog.length > 500) debugLog.splice(0, debugLog.length - 500);
+    console.log("[h3]", msg);
+    clearTimeout(debugSave); debugSave = setTimeout(() => store.set("debugLog", debugLog), 500);
+  }
+  dbg(`page loaded, version ${BUILD}, ${navigator.userAgent.replace(/^Mozilla\/5\.0 /, "")}`);
+  window.addEventListener("error", (e) => dbg(`page error: ${e.message} (${(e.filename || "").split("/").pop()}:${e.lineno})`));
+  window.addEventListener("unhandledrejection", (e) => dbg(`unhandled: ${(e.reason && e.reason.message) || e.reason}`));
   const inflight = new Set();   // AbortControllers of requests in flight (dropped on a return from the background)
   // opts: stall (ms without data before giving up), droppable (may be dropped on a return from the background;
   // default: reads only), meta (filled with the reply's size and how long its body took to arrive)
@@ -333,6 +351,7 @@ input[type], select, textarea { font-size: 16px; }
     const ctl = new AbortController();
     if (droppable) inflight.add(ctl);              // not a /run that may already have created its job
     let timer, res, text, bodyAt;
+    const t0 = performance.now(), what = `${method} ${path.replace(/\?.*$/, "")} @${String(ep).slice(0, 6)}`, quiet = path === "/health";
     const arm = () => { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), stall); };
     try {
       arm();
@@ -348,10 +367,12 @@ input[type], select, textarea { font-size: 16px; }
       } else text = await res.text();
       if (meta) Object.assign(meta, { bytes: text.length, bodyMs: performance.now() - bodyAt });
     } catch (e) {
+      dbg(`${what} ✗ ${ctl.resumed ? "dropped (back from background)" : e.name === "AbortError" ? `no data for ${stall / 1000} s` : e.message} after ${Math.round(performance.now() - t0)} ms`);
       if (ctl.resumed) { const r = new Error("Interrupted while the app was in the background; try again."); r.resumed = true; throw r; }
       throw new Error(e.name === "AbortError" ? "RunPod didn't answer in time." : "Can't reach RunPod (offline?).");
     } finally { clearTimeout(timer); inflight.delete(ctl); }
     let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    if (!quiet || !res.ok) dbg(`${what} → ${res.status}${data.status ? " " + data.status : ""} in ${Math.round(performance.now() - t0)} ms, ${(text.length / 1e3).toFixed(0)} KB`);
     if (!res.ok) {
       const err = new Error(res.status === 401 ? "RunPod rejected the API key (check Settings)." : (data.error || data.detail || `RunPod error ${res.status}`));
       err.status = res.status; throw err;
@@ -778,7 +799,6 @@ input[type], select, textarea { font-size: 16px; }
   }
 
   function ensurePolling() { if (!polling && active().length) pollQueue(); }
-  let results = Promise.resolve();
   // Ask a worker for a finished job's video from the volume (RunPod forgot or rejected the result, or Recover)
   async function startFetch(j) {
     const f = await api("POST", "/run", { input: { action: "fetch", job: j.id, api_key: cfg.h3Key } }, j.ep || cfg.endpoint);
@@ -830,11 +850,13 @@ input[type], select, textarea { font-size: 16px; }
               // In finishing order, without holding up the polling of the other jobs
               const out = s.output || {}, input = { ...j.input, seed: j.seed, jobId: j.id, kind: j.kind, label: j.label, ep: j.ep || cfg.endpoint, dl: meta };
               j.delivered = false;                       // until it's in History (survives the app closing)
-              results = results.then(() => showResult(out, input)).then((summary) => {
+              dbg(`${j.label}: done on RunPod, ${out.stored ? `stored (${(out.size / 1e6).toFixed(1)} MB)` : out.video_b64 ? "video in the result" : "no video in the result"}`);
+              showResult(out, input).then((summary) => {
                 j.delivered = true;
                 if (summary) j.text += ` · ${summary}`;
                 saveQueue(); renderQueue();
               }).catch((e) => {
+                dbg(`${j.label}: download failed: ${e.message}`);
                 Object.assign(j, { bad: true, text: `Couldn't download the video: ${e.message}` });   // Recover tries again
                 saveQueue(); renderQueue(); showStatus(`Couldn't show "${j.label}": ${e.message}`, { error: true });
               });
@@ -959,7 +981,7 @@ input[type], select, textarea { font-size: 16px; }
         await sleep(delay); await whenUnlocked();
         try { s = await api("GET", `/status/${s.id}`, null, ep, { meta }); } catch (e) { if (!e.resumed) throw e; }
       }
-      if (stats) stats.push({ wait: (s.delayTime || 0) / 1000, run: (s.executionTime || 0) / 1000, bytes: meta.bytes || 0, transfer: (meta.bodyMs || 0) / 1000 });
+      if (stats) stats.push({ ok: s.status === "COMPLETED" && !(s.output && s.output.error), wait: (s.delayTime || 0) / 1000, run: (s.executionTime || 0) / 1000, bytes: meta.bytes || 0, transfer: (meta.bodyMs || 0) / 1000 });
       if (s.status === "COMPLETED") { if (s.output && s.output.error) throw new Error(s.output.error); return s.output || {}; }
       throw new Error(parseError(s));
     }
@@ -974,7 +996,11 @@ input[type], select, textarea { font-size: 16px; }
         const i = next++;
         for (let attempt = 1; ; attempt++) {
           try { parts[i] = b64Bytes((await runOnWorker(ep, { action: "fetch", job: out.job, offset: i * step, length: step }, stats)).chunk_b64); break; }
-          catch (e) { if (attempt >= 3 || failed) { failed = failed || e; throw failed; } await sleep(2000); }
+          catch (e) {
+            dbg(`${label}: part ${i + 1} of ${n}, attempt ${attempt} failed: ${e.message}`);
+            if (attempt >= 3 || failed) { failed = failed || e; throw failed; }
+            await sleep(2000);
+          }
         }
         done++;
         showStatus(`Downloading "${label}" (${done} of ${n} parts)…`, { progress: done / n });
@@ -988,8 +1014,9 @@ input[type], select, textarea { font-size: 16px; }
   function downloadSummary(bytes, seconds, stats, inline) {
     const s = (x) => (x < 10 ? x.toFixed(1) : Math.round(x)) + " s", mb = (bytes / 1e6).toFixed(1) + " MB";
     if (inline) return `downloaded ${mb} in ${s(seconds)} (with the result)`;
-    const wait = Math.max(0, ...stats.map((x) => x.wait)), transfer = stats.reduce((a, x) => a + x.transfer, 0);
-    return `downloaded ${mb} in ${s(seconds)} (${stats.length} parts; waited up to ${s(wait)} for a worker; ${s(transfer)} transferring)`;
+    const ok = stats.filter((x) => x.ok), retries = stats.length - ok.length;
+    const wait = Math.max(0, ...stats.map((x) => x.wait)), transfer = ok.reduce((a, x) => a + x.transfer, 0);
+    return `downloaded ${mb} in ${s(seconds)} (${ok.length} parts${retries ? `, ${retries} retried` : ""}; waited up to ${s(wait)} for a worker; ${s(transfer)} transferring)`;
   }
 
   let wipes = 0;                // "Forgot PIN" wipes: a result still on its way is dropped
@@ -1017,9 +1044,12 @@ input[type], select, textarea { font-size: 16px; }
     // The first result since you last queued something plays; later ones wait behind "Next" so a clip you're
     // watching isn't replaced seconds later. The thumbnail is made by History afterwards, not on the way in.
     if (!autoShown || !$("stage").querySelector("video")) { autoShown = true; play(entry); }
-    else { pending.push(entry); showNext(); }
+    else {                                 // in the order they were queued, whichever finished downloading first
+      const at = (e) => { const i = queue.findIndex((j) => j.id === e.jobId); return i < 0 ? Infinity : i; };
+      pending.push(entry); pending.sort((a, b) => at(a) - at(b)); showNext();
+    }
     if (blob) { await db.put(entry); renderHistory(); }
-    if (summary) console.log(`[h3] ${input.label}: ${summary}`, stats);
+    if (summary) dbg(`${input.label}: ${summary}`);
     return summary;
   }
   let autoShown = false;
@@ -1317,9 +1347,18 @@ input[type], select, textarea { font-size: 16px; }
   function openSettings() {
     $("cfgEndpoint").value = cfg.endpoint; $("cfgComfy").value = cfg.comfyEndpoint || ""; $("cfgRunpod").value = cfg.runpodKey; $("cfgH3").value = cfg.h3Key;
     $("cfgCivitai").value = cfg.civitaiToken || "";
+    $("buildId").textContent = BUILD; $("debugView").textContent = debugLog.slice(-200).join("\n");
     dlg.showModal();
   }
   $("settingsBtn").onclick = openSettings;
+  $("debugBox").ontoggle = () => { $("debugView").textContent = debugLog.slice(-200).join("\n"); $("debugView").scrollTop = 1e9; };
+  $("copyLog").onclick = async () => {
+    const text = [`H3 Studio ${BUILD}`, ...debugLog].join("\n");
+    try { await navigator.clipboard.writeText(text); $("copyLog").textContent = "Copied"; }
+    catch { $("debugView").textContent = text; $("copyLog").textContent = "Select the text below and copy it"; }
+    setTimeout(() => ($("copyLog").textContent = "Copy debug log"), 2500);
+  };
+  $("clearLog").onclick = () => { debugLog.length = 0; store.set("debugLog", debugLog); $("debugView").textContent = ""; };
   $("settingsForm").onsubmit = () => {
     cfg = { endpoint: $("cfgEndpoint").value.trim(), comfyEndpoint: $("cfgComfy").value.trim(), runpodKey: $("cfgRunpod").value.trim(),
             h3Key: $("cfgH3").value.trim(), civitaiToken: $("cfgCivitai").value.trim() };
