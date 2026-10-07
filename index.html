@@ -323,26 +323,30 @@ input[type], select, textarea { font-size: 16px; }
 
   // ---------------------------------------------------------------- RunPod queue API
   const inflight = new Set();   // AbortControllers of requests in flight (dropped on a return from the background)
-  const api = async (method, path, body, ep = engineEp()) => {
+  // opts: stall (ms without data before giving up), droppable (may be dropped on a return from the background;
+  // default: reads only), meta (filled with the reply's size and how long its body took to arrive)
+  const api = async (method, path, body, ep = engineEp(), { stall = 20000, droppable = method === "GET", meta = null } = {}) => {
     const base = store.get("apiBase", "https://api.runpod.ai");   // override exists only for local testing
     // iPhone Safari can leave a request hanging forever after the app was in the background: give up after 20 s
     // without data. Only a stall counts: a finished job's status carries the whole video (several MB of base64),
     // which can take longer than that on a phone, and restarting it from zero on every poll never gets anywhere.
     const ctl = new AbortController();
-    if (method === "GET") inflight.add(ctl);       // only reads are dropped on resume: a /run may have created its job
-    let timer, res, text;
-    const arm = () => { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), 20000); };
+    if (droppable) inflight.add(ctl);              // not a /run that may already have created its job
+    let timer, res, text, bodyAt;
+    const arm = () => { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), stall); };
     try {
       arm();
       res = await fetch(`${base}/v2/${encodeURIComponent(ep)}${path}`, {
         method, headers: { Authorization: `Bearer ${cfg.runpodKey}`, "Content-Type": "application/json" },
         body: body ? JSON.stringify(body) : undefined, signal: ctl.signal,
       });
+      bodyAt = performance.now();
       if (res.body && res.body.getReader) {
         const reader = res.body.getReader(), parts = [];
         for (;;) { arm(); const { done, value } = await reader.read(); if (done) break; parts.push(value); }
         text = await new Blob(parts).text();
       } else text = await res.text();
+      if (meta) Object.assign(meta, { bytes: text.length, bodyMs: performance.now() - bodyAt });
     } catch (e) {
       if (ctl.resumed) { const r = new Error("Interrupted while the app was in the background; try again."); r.resumed = true; throw r; }
       throw new Error(e.name === "AbortError" ? "RunPod didn't answer in time." : "Can't reach RunPod (offline?).");
@@ -789,7 +793,8 @@ input[type], select, textarea { font-size: 16px; }
         await Promise.all(active().map(async (j) => {
           let s;
           if (!connected()) return;
-          try { s = await api("GET", `/status/${j.fetchId || j.id}`, null, j.ep || cfg.endpoint); }
+          const meta = {};
+          try { s = await api("GET", `/status/${j.fetchId || j.id}`, null, j.ep || cfg.endpoint, { meta }); }
           catch (e) {
             if (!connected() || e.resumed) return;       // locked or back from the background: not the job's fault
             // RunPod forgets a finished job's result after a while (e.g. while the app was in the background), but
@@ -823,9 +828,13 @@ input[type], select, textarea { font-size: 16px; }
             else {
               j.text = j.fetchId ? "Done (recovered from the volume)" : `Done in ${fmtTime((s.output && s.output.seconds) || 0)}`;
               // In finishing order, without holding up the polling of the other jobs
-              const out = s.output || {}, input = { ...j.input, seed: j.seed, jobId: j.id, kind: j.kind, label: j.label, ep: j.ep || cfg.endpoint };
+              const out = s.output || {}, input = { ...j.input, seed: j.seed, jobId: j.id, kind: j.kind, label: j.label, ep: j.ep || cfg.endpoint, dl: meta };
               j.delivered = false;                       // until it's in History (survives the app closing)
-              results = results.then(() => showResult(out, input)).then(() => { j.delivered = true; saveQueue(); }).catch((e) => {
+              results = results.then(() => showResult(out, input)).then((summary) => {
+                j.delivered = true;
+                if (summary) j.text += ` · ${summary}`;
+                saveQueue(); renderQueue();
+              }).catch((e) => {
                 Object.assign(j, { bad: true, text: `Couldn't download the video: ${e.message}` });   // Recover tries again
                 saveQueue(); renderQueue(); showStatus(`Couldn't show "${j.label}": ${e.message}`, { error: true });
               });
@@ -936,40 +945,64 @@ input[type], select, textarea { font-size: 16px; }
   };
   // One worker job from start to finish (the chunks of a stored video)
   const whenUnlocked = async () => { while (!connected()) await sleep(1000); };   // locked: keys are gone until unlock
-  async function runOnWorker(ep, input) {
-    await whenUnlocked();
-    const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } }, ep);
-    for (let delay = 800; ; delay = Math.min(delay + 250, 2000)) {
+  // One quick, repeatable worker job (a chunk of a stored video). /runsync returns the result in the same request
+  // (RunPod holds it open up to ~90 s); if the job takes longer, e.g. while a worker starts, poll its status.
+  // `stats` gets how long RunPod queued it, how long it ran, and how long its data took to arrive.
+  async function runOnWorker(ep, input, stats = null) {
+    for (;;) {
       await whenUnlocked();
+      const meta = {};
       let s;
-      try { s = await api("GET", `/status/${job.id}`, null, ep); } catch (e) { if (e.resumed) continue; throw e; }
+      try { s = await api("POST", "/runsync", { input: { ...input, api_key: cfg.h3Key } }, ep, { stall: 120000, droppable: true, meta }); }
+      catch (e) { if (e.resumed) continue; throw e; }                      // repeatable: just ask again
+      for (let delay = 800; s.status === "IN_QUEUE" || s.status === "IN_PROGRESS"; delay = Math.min(delay + 250, 2000)) {
+        await sleep(delay); await whenUnlocked();
+        try { s = await api("GET", `/status/${s.id}`, null, ep, { meta }); } catch (e) { if (!e.resumed) throw e; }
+      }
+      if (stats) stats.push({ wait: (s.delayTime || 0) / 1000, run: (s.executionTime || 0) / 1000, bytes: meta.bytes || 0, transfer: (meta.bodyMs || 0) / 1000 });
       if (s.status === "COMPLETED") { if (s.output && s.output.error) throw new Error(s.output.error); return s.output || {}; }
-      if (["FAILED", "CANCELLED", "TIMED_OUT"].includes(s.status)) throw new Error(parseError(s));
-      await sleep(delay);
+      throw new Error(parseError(s));
     }
   }
   // A video too big for a job's result (RunPod caps it at 10 MB) stays on the volume: download it in chunks.
-  async function downloadStored(out, ep, label) {
-    const parts = [], step = out.chunk_bytes || 6 * 1024 * 1024, n = Math.ceil(out.size / step);
-    for (let off = 0, i = 1; off < out.size; off += step, i++) {
-      showStatus(`Downloading "${label}" (part ${i} of ${n})…`, { progress: (i - 1) / n });
-      for (let attempt = 1; ; attempt++) {
-        try { parts.push(b64Bytes((await runOnWorker(ep, { action: "fetch", job: out.job, offset: off, length: step })).chunk_b64)); break; }
-        catch (e) { if (attempt >= 3) throw e; await sleep(2000); }
+  async function downloadStored(out, ep, label, stats) {
+    const step = out.chunk_bytes || 3.5 * 1024 * 1024, n = Math.ceil(out.size / step), parts = new Array(n);
+    let next = 0, done = 0, failed = null;
+    showStatus(`Downloading "${label}" (0 of ${n} parts)…`, { progress: 0 });
+    const lane = async () => {                         // two lanes: two parts in flight at a time
+      while (next < n && !failed) {
+        const i = next++;
+        for (let attempt = 1; ; attempt++) {
+          try { parts[i] = b64Bytes((await runOnWorker(ep, { action: "fetch", job: out.job, offset: i * step, length: step }, stats)).chunk_b64); break; }
+          catch (e) { if (attempt >= 3 || failed) { failed = failed || e; throw failed; } await sleep(2000); }
+        }
+        done++;
+        showStatus(`Downloading "${label}" (${done} of ${n} parts)…`, { progress: done / n });
       }
-    }
+    };
+    await Promise.all([lane(), lane()]);
     showStatus(`Downloaded "${label}".`, { progress: 1 });
     return new Blob(parts, { type: "video/mp4" });
+  }
+  // "downloaded 5.1 MB in 34 s (2 parts; waited up to 28 s for a worker; 6 s transferring)", for the queue entry
+  function downloadSummary(bytes, seconds, stats, inline) {
+    const s = (x) => (x < 10 ? x.toFixed(1) : Math.round(x)) + " s", mb = (bytes / 1e6).toFixed(1) + " MB";
+    if (inline) return `downloaded ${mb} in ${s(seconds)} (with the result)`;
+    const wait = Math.max(0, ...stats.map((x) => x.wait)), transfer = stats.reduce((a, x) => a + x.transfer, 0);
+    return `downloaded ${mb} in ${s(seconds)} (${stats.length} parts; waited up to ${s(wait)} for a worker; ${s(transfer)} transferring)`;
   }
 
   let wipes = 0;                // "Forgot PIN" wipes: a result still on its way is dropped
   async function showResult(out, input) {
-    const epoch = wipes;
-    let blob;
+    const epoch = wipes, started = performance.now(), stats = [];
+    let blob, summary = "";
     if (out.video_b64) {
       blob = new Blob([b64Bytes(out.video_b64)], { type: "video/mp4" });
+      const dl = input.dl || {};                       // it came with the status reply that said "done"
+      summary = downloadSummary(blob.size, (dl.bodyMs || 0) / 1000, [], true);
     } else if (out.stored) {
-      blob = await downloadStored(out, input.ep, input.label || "video");
+      blob = await downloadStored(out, input.ep, input.label || "video", stats);
+      summary = downloadSummary(out.size, (performance.now() - started) / 1000, stats, false);
     } else if (out.video_url) {
       try { blob = await (await fetch(out.video_url)).blob(); } catch { blob = null; }
     }
@@ -986,6 +1019,8 @@ input[type], select, textarea { font-size: 16px; }
     if (!autoShown || !$("stage").querySelector("video")) { autoShown = true; play(entry); }
     else { pending.push(entry); showNext(); }
     if (blob) { await db.put(entry); renderHistory(); }
+    if (summary) console.log(`[h3] ${input.label}: ${summary}`, stats);
+    return summary;
   }
   let autoShown = false;
   const pending = [];
