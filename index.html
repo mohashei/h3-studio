@@ -41,6 +41,7 @@ header .sub { color: var(--mute); font-size: 13px; }
 .spacer { flex: 1; }
 .pill { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; padding: 5px 10px; border-radius: 999px; background: var(--sunken); border: 1px solid var(--line); white-space: nowrap; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--mute); }
+.pill.low { color: var(--err); border-color: var(--err); }
 .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
 .dot.pulse { animation: pulse 1.4s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: .35; } }
@@ -142,6 +143,7 @@ input[type], select, textarea { font-size: 16px; }
   <h1>H3 Studio</h1>
   <span class="sub">MiniMax-H3 Ultra Fast on RunPod</span>
   <span class="spacer"></span>
+  <span class="pill hidden" id="balancePill"><span id="balanceText"></span></span>
   <span class="pill" id="workerPill" title="RunPod worker state (checking it does not wake or bill the worker)"><span class="dot" id="workerDot"></span><span id="workerText">Checking…</span></span>
   <button class="small" id="wakeBtn" title="Start a worker and load the model now, so your first generation starts immediately">Start worker</button>
   <button class="small" id="settingsBtn" aria-label="Settings">Settings</button>
@@ -328,7 +330,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "9815f53 2026-10-07 15:05Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "a8ca348 2026-10-08 05:45Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -697,12 +699,25 @@ input[type], select, textarea { font-size: 16px; }
     return e.error_message || e.error || JSON.stringify(e);
   }
 
+  // RunPod balance, as the last worker result reported it (workers read it with a read-only key; browsers can't)
+  const LOW_BALANCE = 5;
+  function showBalance(b = store.get("balance", null)) {
+    if (!b || typeof b.usd !== "number") return;
+    store.set("balance", b);
+    const pill = $("balancePill"), when = new Date(b.at * 1000);
+    $("balanceText").textContent = `$${b.usd.toFixed(2)}`;
+    pill.title = `RunPod balance at ${when.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}` +
+                 (b.usd < LOW_BALANCE ? ". Low: top up in the RunPod console so the endpoints keep working." : "");
+    pill.classList.toggle("low", b.usd < LOW_BALANCE);
+    pill.classList.remove("hidden");
+  }
   $("wakeBtn").onclick = async () => {
     showStatus("Starting a worker and loading the model…");
     try {
       const out = await runJob("warmup", { action: "warmup" });
       if (!out) return;
       if (out.config) { store.set(engineKey("serverConfig"), out.config); applyServerConfig(out.config); fillSelects(); }
+      if (out.balance) showBalance(out.balance);
       showStatus("Worker ready. It stays up 2 minutes after the last job.", { progress: 1 });
     } catch (e) { showStatus(e.message, { error: true }); }
   };
@@ -846,6 +861,7 @@ input[type], select, textarea { font-size: 16px; }
           else if (s.status === "IN_PROGRESS") j.text = j.stopping ? "Stopping…" : (typeof s.output === "string" ? s.output : "Working…");
           else if (s.status === "COMPLETED") {
             j.done = true; j.recover = false;
+            if (s.output && s.output.balance) showBalance(s.output.balance);
             if (s.output && s.output.error) { j.bad = true; j.text = s.output.error; }
             else {
               j.text = j.fetchId ? "Done (recovered from the volume)" : `Done in ${fmtTime((s.output && s.output.seconds) || 0)}`;
@@ -1469,13 +1485,14 @@ input[type], select, textarea { font-size: 16px; }
     pinKey = null; cfg = { endpoint: "", runpodKey: "", h3Key: "" };
     $("stage").innerHTML = '<div class="empty">Your video will appear here.</div>'; stageEntry = null;
     pending.length = 0; showNext();
+    $("balancePill").classList.add("hidden");
     $("resultActions").classList.add("hidden"); $("report").textContent = ""; $("history").innerHTML = ""; $("batch").innerHTML = "";
     if (dlg.open) dlg.close();
     showLock(store.get("pin", null) ? "unlock" : "setup");
   }
   function unlocked() {
     lockEl.classList.add("hidden");
-    applyEngine(); renderHistory(); renderQueue();
+    applyEngine(); renderHistory(); renderQueue(); showBalance();
     if (!connected()) openSettings(); else { pollHealth(); ensurePolling(); }
   }
 
@@ -1512,7 +1529,7 @@ input[type], select, textarea { font-size: 16px; }
   };
   $("pinForgot").onclick = async () => {
     if (!confirm("Reset the PIN? This deletes the saved keys AND the video History on this device, so the lock can't be bypassed. You'll set a new PIN and re-enter your keys.")) return;
-    for (const k of ["pin", "pinFails", "cfgSealed", "cfg", "queue"]) store.del(k);
+    for (const k of ["pin", "pinFails", "cfgSealed", "cfg", "queue", "balance", "debugLog"]) store.del(k);
     queue = []; wipes++;
     try { const all = await db.all(); for (const e of all) await db.del(e.id); } catch {}
     lockNow();
