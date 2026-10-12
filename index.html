@@ -146,6 +146,7 @@ input[type], select, textarea { font-size: 16px; }
   <span class="pill hidden" id="balancePill"><span id="balanceText"></span></span>
   <span class="pill" id="workerPill" title="RunPod worker state (checking it does not wake or bill the worker)"><span class="dot" id="workerDot"></span><span id="workerText">Checking…</span></span>
   <button class="small" id="wakeBtn" title="Start a worker and load the model now, so your first generation starts immediately">Start worker</button>
+  <button class="small hidden" id="stopWorkerBtn" title="Shut the idle worker down now instead of after its idle timeout (it bills while it's up)">Stop worker</button>
   <button class="small" id="settingsBtn" aria-label="Settings">Settings</button>
   <button class="small" id="lockBtn" aria-label="Lock">Lock</button>
 </header>
@@ -330,7 +331,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "a8ca348 2026-10-08 05:45Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "a81f03c 2026-10-12 17:29Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -611,6 +612,8 @@ input[type], select, textarea { font-size: 16px; }
     try {
       health = await api("GET", "/health");
       const w = health.workers || {}, j = health.jobs || {};
+      const up = (w.running || 0) + (w.ready || 0) + (w.idle || 0) > 0;
+      $("stopWorkerBtn").classList.toggle("hidden", !up || active().length > 0 || (j.inQueue || 0) + (j.inProgress || 0) > 0);
       if ((j.inProgress || 0) > 0 || (w.running || 0) > 0) setPill("ok pulse", "Working");
       else if ((w.ready || 0) + (w.idle || 0) > 0) setPill("ok", "Worker up");
       else if ((w.initializing || 0) > 0) setPill("warn pulse", "Starting");
@@ -711,6 +714,28 @@ input[type], select, textarea { font-size: 16px; }
     pill.classList.toggle("low", b.usd < LOW_BALANCE);
     pill.classList.remove("hidden");
   }
+  // Stop worker: the worker shuts itself down (it refuses while other jobs are on it). The request may only wait
+  // 15 s in RunPod's queue, so it can't wake a fresh worker just to stop it if the idle one went away meanwhile.
+  $("stopWorkerBtn").onclick = async () => {
+    const btn = $("stopWorkerBtn"); btn.disabled = true;
+    try {
+      const h = await api("GET", "/health"), w = h.workers || {};
+      if ((w.running || 0) + (w.ready || 0) + (w.idle || 0) === 0) { showStatus("No worker is running."); return; }
+      const job = await api("POST", "/run", { input: { action: "stop", api_key: cfg.h3Key }, policy: { ttl: 15000 } });
+      dbg(`stop worker: sent ${job.id}`);
+      for (let i = 0; i < 20; i++) {
+        await sleep(1500);
+        const s = await api("GET", `/status/${job.id}`);
+        if (s.status === "COMPLETED") {
+          const out = s.output || {};
+          showStatus(out.stopped ? "Worker stopped. It no longer bills." : out.message || "The worker didn't stop.", { error: !out.stopped });
+          break;
+        }
+        if (["FAILED", "CANCELLED", "TIMED_OUT"].includes(s.status)) { showStatus("The worker had already gone; nothing to stop."); break; }
+      }
+    } catch (e) { showStatus(e.message, { error: true }); }
+    finally { btn.disabled = false; pollHealth(); }
+  };
   $("wakeBtn").onclick = async () => {
     showStatus("Starting a worker and loading the model…");
     try {
