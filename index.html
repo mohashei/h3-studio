@@ -331,7 +331,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "a81f03c 2026-10-12 17:29Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "ba996fc 2026-10-12 19:48Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -463,15 +463,17 @@ input[type], select, textarea { font-size: 16px; }
   let lastSlot = "first";                                 // the slot you touched last gets a ⌘V paste
   const LABEL = { first: "First frame", last: "Last frame" };
 
-  let startJob = null;          // { id, label }: start from the last frame of a job that hasn't finished yet
+  let startJob = null;          // { id, label, done, extend }: start from that job's last frame, or extend it (its last
+                                //   0.9 s of video and sound carried over; ComfyUI engine), even before it has finished
+  const EXTEND_OVERLAP = 22;    // frames an extension repeats from the clip it extends (the worker says so too)
   let continueFrom = null;      // job id of a finished clip that "Continue" took its last frame from
   let continueAt = null;        // seconds into that clip when the start frame came from the middle of it (Join cuts there)
   function setStartJob(job, preview = null) {
     const { box } = slots.first;
     frames.first = null; startJob = job; continueFrom = null; continueAt = null;   // callers set a parent link again if any
     box.innerHTML = (preview ? `<img alt="">` : "") +
-                    `<span class="chip${preview ? " over-img" : ""}">↳ ${job.done ? "last frame of" : "after"}:<br><b></b>` +
-                    `${job.done ? "" : "<br><small>its last frame, once it's done</small>"}</span>` +
+                    `<span class="chip${preview ? " over-img" : ""}">↳ ${job.extend ? "extends" : job.done ? "last frame of" : "after"}:<br><b></b>` +
+                    `${job.extend ? "<br><small>its last 0.9 s, video and sound</small>" : job.done ? "" : "<br><small>its last frame, once it's done</small>"}</span>` +
                     `<button class="x small" type="button" aria-label="Remove">×</button>`;
     if (preview) box.querySelector("img").src = preview;
     box.querySelector("b").textContent = job.label;
@@ -776,6 +778,7 @@ input[type], select, textarea { font-size: 16px; }
     if (!prompt) { $("prompt").focus(); showStatus("Write a prompt first.", { error: true }); return; }
     const base = { action: "generate", engine: activeEngine(), prompt, preset: presetSel.value, canvas: canvasSel.value, duration: Number(duration.value) };
     if (frames.first) base.image = frames.first;
+    else if (startJob && startJob.extend) base.extend_from = { job: startJob.id };
     else if (startJob) base.start_from = { job: startJob.id };
     if (frames.last) base.last_image = frames.last;
     const parent = startJob ? startJob.id : continueFrom;
@@ -801,8 +804,8 @@ input[type], select, textarea { font-size: 16px; }
   // Clips that lead up to `id` through Continue links, oldest first (queued jobs and History both count).
   async function chainTo(id) {
     const hist = await db.all(), byJob = new Map();
-    for (const e of hist) if (e.jobId) byJob.set(e.jobId, { id: e.jobId, parent: e.parentJob, at: e.parentAt ?? null, entry: e, label: e.prompt });
-    for (const j of queue) if (j.kind === "generate" && !byJob.has(j.id)) byJob.set(j.id, { id: j.id, parent: j.input.parent, at: j.input.parent_at ?? null, job: j, label: j.label });
+    for (const e of hist) if (e.jobId) byJob.set(e.jobId, { id: e.jobId, parent: e.parentJob, at: e.parentAt ?? null, overlap: e.overlap ?? null, entry: e, label: e.prompt });
+    for (const j of queue) if (j.kind === "generate" && !byJob.has(j.id)) byJob.set(j.id, { id: j.id, parent: j.input.parent, at: j.input.parent_at ?? null, overlap: j.input.extend_from ? EXTEND_OVERLAP : null, job: j, label: j.label });
     const chain = [];
     for (let cur = byJob.get(id); cur && chain.length < 24; cur = cur.parent ? byJob.get(cur.parent) : null) chain.unshift(cur);
     return chain;
@@ -812,9 +815,12 @@ input[type], select, textarea { font-size: 16px; }
   // or the video itself for clips the worker no longer keeps (older than ~a week, or from before job ids were saved).
   // A continuation from the last frame repeats it, so its first frame is dropped; one that started from a frame in the
   // middle keeps its first frame and the previous clip is cut just before that frame instead (`end`, in seconds).
+  // An extension repeats the end of the clip it extends (`overlap` frames): it starts after them instead.
   async function clipRef(node, prev, next) {
-    const trim_first = !!(prev && node.parent && node.parent === prev.id && node.at == null);
-    const cut = next && next.parent && next.parent === node.id && next.at != null ? { end: next.at } : {};
+    const follows = !!(prev && node.parent && node.parent === prev.id);
+    const trim_first = follows && node.at == null && !node.overlap;
+    const cut = { ...(next && next.parent && next.parent === node.id && next.at != null ? { end: next.at } : {}),
+                  ...(follows && node.overlap ? { start: node.overlap / 24 } : {}) };
     const e = node.entry;
     if (node.job && !node.job.done) return { job: node.id, wait: true, trim_first, ...cut };
     if (e && e.jobId && Date.now() - new Date(e.created).getTime() < 6 * 86400e3) return { job: e.jobId, wait: false, trim_first, ...cut };
@@ -967,6 +973,7 @@ input[type], select, textarea { font-size: 16px; }
       if (j === running) li.className = "active"; else if (j.bad) li.className = "bad";
       const qa = document.createElement("span"); qa.className = "qa";
       const add = (text, title, fn) => { const b = document.createElement("button"); b.className = "small"; b.textContent = text; b.title = title; b.onclick = fn; qa.append(b); };
+      if (j.kind === "generate" && !j.bad && cfg.comfyEndpoint) add("Extend after", "Continue this video with its last 0.9 s (motion and sound) carried over, once it's done", () => extendJob({ id: j.id, label: j.label, done: j.done && !j.bad }));
       if (j.kind === "generate" && !j.bad) add("Continue after", "Start the next video from this one's last frame, once it's done", () => {
         frameTicket.first++; setStartJob({ id: j.id, label: j.label });
         const box = $("prompt"); box.scrollIntoView({ behavior: "smooth", block: "center" }); box.focus({ preventScroll: true });
@@ -1131,7 +1138,8 @@ input[type], select, textarea { font-size: 16px; }
     if (epoch !== wipes) return;
     const entry = { id: Date.now(), created: new Date().toISOString(),
                     prompt: input.kind === "join" ? (input.label || "Joined clips") : (input.prompt || "(resumed job)"),
-                    jobId: input.jobId || null, parentJob: input.parent || null, parentAt: input.parent_at ?? null, kind: input.kind || "generate",
+                    jobId: input.jobId || null, parentJob: input.parent || null, parentAt: input.parent_at ?? null,
+                    overlap: out.overlap_frames || (input.extend_from ? EXTEND_OVERLAP : null), kind: input.kind || "generate",
                     engine: input.engine || "ultra", preset: input.preset || "", canvas: input.canvas || "", duration: input.duration, seed: out.seed ?? input.seed,
                     lora: input.lora ? { link: loraUrl.value.trim(), strength: input.lora.strength, steps: input.lora.steps } : null,
                     report: out.report || "", blob, url: null };     // signed links expire within the hour
@@ -1279,6 +1287,17 @@ input[type], select, textarea { font-size: 16px; }
       here.title = "Pause the video on a frame, then start the next video from it";
       here.onclick = () => useFrameHere(v, entry, "first", here, () => cont.click());
       cont.after(here);
+      const stored = entry.jobId && Date.now() - new Date(entry.created).getTime() < 6 * 86400e3;
+      if (stored && cfg.comfyEndpoint) {
+        const ext = document.createElement("button"); ext.className = "small primary"; ext.textContent = "Extend";
+        ext.title = "Continue this video with its last 0.9 s (motion and sound) carried over; ComfyUI engine";
+        ext.onclick = async () => {
+          let preview = null;
+          try { preview = (await grabFrame(entry.blob, "last", 480)).toDataURL("image/jpeg", 0.85); } catch {}
+          extendJob({ id: entry.jobId, label: entry.prompt, done: true }, preview);
+        };
+        here.after(ext);
+      }
       if (entry.parentJob) {
         const jc = document.createElement("button"); jc.className = "small"; jc.textContent = "Join chain";
         jc.title = "Join this clip with the clips it continues from, in order";
@@ -1317,6 +1336,23 @@ input[type], select, textarea { font-size: 16px; }
       acts.append(del);
     }
   }
+  // Extend a clip: the next video starts with its last 0.9 s (video and sound), so motion and audio carry over.
+  // Needs the ComfyUI engine; the job can be done or still on its way (the worker waits for it).
+  function extendJob(job, preview = null) {
+    if (activeEngine() !== "comfy") {
+      if (!cfg.comfyEndpoint) { showStatus("Extend needs the ComfyUI engine: add its endpoint in Settings.", { error: true }); return; }
+      engine = "comfy"; store.set("engine", engine); applyEngine(); pollHealth();
+    }
+    frameTicket.first++;
+    setStartJob({ ...job, extend: true }, preview);
+    continueFrom = job.id; continueAt = null;
+    emptySlot("last");
+    const box = $("prompt");
+    box.scrollIntoView({ behavior: "smooth", block: "center" });
+    box.focus({ preventScroll: true }); box.setSelectionRange(box.value.length, box.value.length);
+    showStatus("The next video extends that one (its last 0.9 s carry over). Describe what happens next, then Generate. Duration is the new part.", { progress: 1 });
+  }
+
   // The frame the player is showing, into the start or end slot. Times snap to the 24 fps frame grid: the frame
   // is read from the middle of its interval (robust to seek rounding), and a Join cuts the source clip at its start.
   async function useFrameHere(v, entry, to, btn, atLastFrame = null) {
@@ -1393,7 +1429,7 @@ input[type], select, textarea { font-size: 16px; }
   $("selectBtn").onclick = () => setSelecting(true);
   $("joinCancel").onclick = () => setSelecting(false);
   $("joinSelected").onclick = async () => {
-    const nodes = selected.map((e) => ({ id: e.jobId || `local-${e.id}`, parent: e.parentJob, at: e.parentAt ?? null, entry: e, label: e.prompt }));
+    const nodes = selected.map((e) => ({ id: e.jobId || `local-${e.id}`, parent: e.parentJob, at: e.parentAt ?? null, overlap: e.overlap ?? null, entry: e, label: e.prompt }));
     const label = selected.map((e) => e.prompt).join(" → ");
     setSelecting(false);
     await queueJoin(nodes, label);
