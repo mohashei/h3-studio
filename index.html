@@ -76,6 +76,12 @@ button.small { padding: 5px 10px; font-size: 13px; }
 button.full { width: 100%; }
 .hint { color: var(--mute); font-size: 13px; margin: 6px 0 0; }
 .frames { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.refs { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; }
+.ref { position: relative; aspect-ratio: 1; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--sunken); cursor: pointer; }
+.ref img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ref .tag { position: absolute; left: 0; right: 0; bottom: 0; font-size: 11px; padding: 2px 4px; background: rgba(0,0,0,.6); color: #fff; text-align: center; }
+.ref .x { position: absolute; top: 3px; right: 3px; padding: 0 6px; font-size: 12px; }
+.ref.add { display: grid; place-items: center; border-style: dashed; color: var(--mute); font-size: 13px; text-align: center; }
 .frame { position: relative; border: 1px dashed var(--line); border-radius: 10px; background: var(--sunken); aspect-ratio: 16 / 10; display: grid; place-items: center; overflow: hidden; cursor: pointer; color: var(--mute); font-size: 13px; text-align: center; padding: 6px; }
 .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .frame .x { position: absolute; top: 4px; right: 4px; z-index: 1; padding: 2px 8px; font-size: 12px; }
@@ -190,6 +196,13 @@ input[type], select, textarea { font-size: 16px; }
       </div>
       <input type="file" id="firstInput" accept="image/*" class="hidden">
       <input type="file" id="lastInput" accept="image/*" class="hidden">
+
+      <div id="refsRow" class="hidden">
+        <label>References (optional)</label>
+        <p class="hint" style="margin:0 0 6px">People, outfits, places or things to keep consistent. Name them in the prompt: tap a photo to insert its tag, e.g. &lt;Picture 1&gt;. Kept until you remove them. ComfyUI engine.</p>
+        <div class="refs" id="refs"></div>
+        <input type="file" id="refInput" accept="image/*" multiple class="hidden">
+      </div>
 
       <label for="loraUrl">LoRA (optional)</label>
       <input type="text" id="loraUrl" spellcheck="false" autocomplete="off" placeholder="Civitai or Hugging Face link to an H3 LoRA">
@@ -331,7 +344,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "ba996fc 2026-10-12 19:48Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "2314200 2026-10-13 21:57Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -436,6 +449,7 @@ input[type], select, textarea { font-size: 16px; }
   function applyEngine() {
     const e = activeEngine();
     $("engineRow").classList.toggle("hidden", !cfg.comfyEndpoint);
+    $("refsRow").classList.toggle("hidden", e !== "comfy");
     $("engine").value = e;
     applyServerConfig(ENGINE_DEFAULTS[e]);
     const saved = store.get(engineKey("serverConfig", e), null);
@@ -473,7 +487,7 @@ input[type], select, textarea { font-size: 16px; }
     frames.first = null; startJob = job; continueFrom = null; continueAt = null;   // callers set a parent link again if any
     box.innerHTML = (preview ? `<img alt="">` : "") +
                     `<span class="chip${preview ? " over-img" : ""}">↳ ${job.extend ? "extends" : job.done ? "last frame of" : "after"}:<br><b></b>` +
-                    `${job.extend ? "<br><small>its last 0.9 s, video and sound</small>" : job.done ? "" : "<br><small>its last frame, once it's done</small>"}</span>` +
+                    `${job.extend ? `<br><small>${job.frame != null ? `the 0.9 s up to ${(job.frame / 24).toFixed(2)} s` : "its last 0.9 s"}, video and sound</small>` : job.done ? "" : "<br><small>its last frame, once it's done</small>"}</span>` +
                     `<button class="x small" type="button" aria-label="Remove">×</button>`;
     if (preview) box.querySelector("img").src = preview;
     box.querySelector("b").textContent = job.label;
@@ -547,6 +561,45 @@ input[type], select, textarea { font-size: 16px; }
     const which = !filled(lastSlot) ? lastSlot : !filled("first") ? "first" : !filled("last") ? "last" : lastSlot;
     setFrame(which, item.getAsFile());
   });
+
+  // Reference photos (<Picture 1>...): kept in this browser until removed, sent with every ComfyUI generation.
+  const MAX_REFS = 9;
+  let refs = store.get("refs", []) || [];
+  function renderRefs() {
+    const box = $("refs"); box.innerHTML = "";
+    refs.forEach((url, i) => {
+      const el = document.createElement("div"); el.className = "ref"; el.title = `Tap to insert <Picture ${i + 1}> into the prompt`;
+      el.innerHTML = `<img alt=""><span class="tag">&lt;Picture ${i + 1}&gt;</span><button class="x small" type="button" aria-label="Remove">×</button>`;
+      el.querySelector("img").src = url;
+      el.onclick = () => {
+        const p = $("prompt"), tag = `<Picture ${i + 1}>`, at = p.selectionStart ?? p.value.length;
+        p.value = p.value.slice(0, at) + tag + p.value.slice(p.selectionEnd ?? at);
+        p.focus(); p.setSelectionRange(at + tag.length, at + tag.length);
+      };
+      el.querySelector(".x").onclick = (e) => { e.stopPropagation(); refs.splice(i, 1); saveRefs(); renderRefs(); };
+      box.append(el);
+    });
+    if (refs.length < MAX_REFS) {
+      const add = document.createElement("div"); add.className = "ref add"; add.tabIndex = 0; add.textContent = "+ Add";
+      add.onclick = () => $("refInput").click();
+      box.append(add);
+    }
+  }
+  function saveRefs() {
+    store.set("refs", refs);
+    if (JSON.stringify(store.get("refs", [])) !== JSON.stringify(refs))   // the browser's storage is full
+      showStatus("Couldn't save the reference photos in this browser; they work until you reload.", { error: true });
+  }
+  async function addRefs(files) {
+    for (const f of [...files].filter((x) => x.type.startsWith("image/"))) {
+      if (refs.length >= MAX_REFS) { showStatus(`Up to ${MAX_REFS} reference photos.`, { error: true }); break; }
+      try { refs.push(await shrink(f, 1024)); } catch (e) { showStatus(e.message, { error: true }); }
+    }
+    saveRefs(); renderRefs();
+  }
+  $("refInput").onchange = () => { const files = [...$("refInput").files]; $("refInput").value = ""; addRefs(files); };
+  $("refs").ondragover = (e) => e.preventDefault();
+  $("refs").ondrop = (e) => { e.preventDefault(); addRefs(e.dataTransfer.files || []); };
 
   function shrink(file, max) {
     return new Promise((resolve, reject) => {
@@ -765,7 +818,8 @@ input[type], select, textarea { font-size: 16px; }
     const ep = engineEp();
     autoShown = false;                                                     // the next result to finish plays
     const job = await api("POST", "/run", { input: { ...input, api_key: cfg.h3Key } }, ep);
-    const { image, last_image, clips, ...meta } = input;                    // keep localStorage small
+    const { image, last_image, clips, refs: refPhotos, ...meta } = input;   // keep localStorage small
+    if (refPhotos) meta.ref_count = refPhotos.length;
     if (clips) meta.clips = clips.map(({ b64, ...c }) => c);
     queue.push({ id: job.id, ep, kind, label, seed: seedValue, input: meta, state: "IN_QUEUE", text: "Queued", done: false, t: Date.now() });
     saveQueue(); renderQueue(); ensurePolling();
@@ -778,9 +832,10 @@ input[type], select, textarea { font-size: 16px; }
     if (!prompt) { $("prompt").focus(); showStatus("Write a prompt first.", { error: true }); return; }
     const base = { action: "generate", engine: activeEngine(), prompt, preset: presetSel.value, canvas: canvasSel.value, duration: Number(duration.value) };
     if (frames.first) base.image = frames.first;
-    else if (startJob && startJob.extend) base.extend_from = { job: startJob.id };
+    else if (startJob && startJob.extend) base.extend_from = { job: startJob.id, ...(startJob.frame != null ? { frame: startJob.frame } : {}) };
     else if (startJob) base.start_from = { job: startJob.id };
     if (frames.last) base.last_image = frames.last;
+    if (refs.length && activeEngine() === "comfy") base.refs = refs.slice(0, MAX_REFS);
     const parent = startJob ? startJob.id : continueFrom;
     if (parent) base.parent = parent;
     if (parent && continueAt != null) base.parent_at = continueAt;
@@ -1297,6 +1352,21 @@ input[type], select, textarea { font-size: 16px; }
           extendJob({ id: entry.jobId, label: entry.prompt, done: true }, preview);
         };
         here.after(ext);
+        const extHere = document.createElement("button"); extHere.className = "small"; extHere.textContent = "Extend from this frame";
+        extHere.title = "Pause on a frame: the next video continues from it, with the 0.9 s before it (motion and sound) carried over";
+        extHere.onclick = async () => {
+          v.pause();
+          const fps = 24, reported = Number(((entry.report || "").match(/(\d+) frames/) || [])[1]) || 0;
+          const total = reported || Math.round((v.duration || 0) * fps);
+          let n = Math.floor(v.currentTime * fps + 0.05);
+          if (total) n = Math.min(n, total - 1);
+          if (total && n >= total - 1) return ext.onclick();                         // the last frame: plain Extend
+          if (n < EXTEND_OVERLAP - 1) { showStatus("Pause at least 0.9 s into the clip to extend from there.", { error: true }); return; }
+          let preview = null;
+          try { preview = (await grabFrame(entry.blob, (n + 0.5) / fps, 480)).toDataURL("image/jpeg", 0.85); } catch {}
+          extendJob({ id: entry.jobId, label: entry.prompt, done: true, frame: n }, preview);
+        };
+        ext.after(extHere);
       }
       if (entry.parentJob) {
         const jc = document.createElement("button"); jc.className = "small"; jc.textContent = "Join chain";
@@ -1345,7 +1415,8 @@ input[type], select, textarea { font-size: 16px; }
     }
     frameTicket.first++;
     setStartJob({ ...job, extend: true }, preview);
-    continueFrom = job.id; continueAt = null;
+    // from a chosen frame: Join chain keeps the first clip up to and including it, then the extension
+    continueFrom = job.id; continueAt = job.frame != null ? (job.frame + 1) / 24 : null;
     emptySlot("last");
     const box = $("prompt");
     box.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -1547,13 +1618,14 @@ input[type], select, textarea { font-size: 16px; }
     $("stage").innerHTML = '<div class="empty">Your video will appear here.</div>'; stageEntry = null;
     pending.length = 0; showNext();
     $("balancePill").classList.add("hidden");
+    $("refs").innerHTML = "";
     $("resultActions").classList.add("hidden"); $("report").textContent = ""; $("history").innerHTML = ""; $("batch").innerHTML = "";
     if (dlg.open) dlg.close();
     showLock(store.get("pin", null) ? "unlock" : "setup");
   }
   function unlocked() {
     lockEl.classList.add("hidden");
-    applyEngine(); renderHistory(); renderQueue(); showBalance();
+    applyEngine(); renderHistory(); renderQueue(); showBalance(); renderRefs();
     if (!connected()) openSettings(); else { pollHealth(); ensurePolling(); }
   }
 
@@ -1590,7 +1662,8 @@ input[type], select, textarea { font-size: 16px; }
   };
   $("pinForgot").onclick = async () => {
     if (!confirm("Reset the PIN? This deletes the saved keys AND the video History on this device, so the lock can't be bypassed. You'll set a new PIN and re-enter your keys.")) return;
-    for (const k of ["pin", "pinFails", "cfgSealed", "cfg", "queue", "balance", "debugLog"]) store.del(k);
+    for (const k of ["pin", "pinFails", "cfgSealed", "cfg", "queue", "balance", "debugLog", "refs"]) store.del(k);
+    refs = [];
     queue = []; wipes++;
     try { const all = await db.all(); for (const e of all) await db.del(e.id); } catch {}
     lockNow();
