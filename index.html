@@ -199,7 +199,7 @@ input[type], select, textarea { font-size: 16px; }
 
       <div id="refsRow" class="hidden">
         <label>References (optional)</label>
-        <p class="hint" style="margin:0 0 6px">People, outfits, places or things to keep consistent. Name them in the prompt: tap a photo to insert its tag, e.g. &lt;Picture 1&gt;. Kept until you remove them. ComfyUI engine.</p>
+        <p class="hint" style="margin:0 0 6px">People, outfits, places or things to keep consistent (ComfyUI engine; kept until you remove them). Define each once, then use the subject: <i>&lt;Subject 1&gt; is the woman in &lt;Picture 1&gt;.</i> Tap a photo to insert its tag. Spoken lines go in <i>&lt;d&gt;[English] Over here!&lt;/d&gt;</i>; plain "quotes" become on-screen text.</p>
         <div class="refs" id="refs"></div>
         <input type="file" id="refInput" accept="image/*" multiple class="hidden">
       </div>
@@ -344,7 +344,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "2314200 2026-10-13 21:57Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "b12793d 2026-10-14 17:08Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -1394,6 +1394,24 @@ input[type], select, textarea { font-size: 16px; }
         };
         frameRow.append(b);
       }
+      // The paused frame as a reference photo (<Picture N>), e.g. a character's face from an earlier clip
+      const asRef = document.createElement("button"); asRef.className = "small"; asRef.textContent = "Use as reference";
+      asRef.title = "Add the frame the player is on to References, to keep that person, outfit or place consistent";
+      asRef.onclick = async () => {
+        v.pause();
+        if (refs.length >= MAX_REFS) { showStatus(`References are full (${MAX_REFS}); remove one first.`, { error: true }); return; }
+        asRef.disabled = true;
+        try {
+          const blob = await canvasBlob(await grabFrame(entry.blob, Math.floor(v.currentTime * 24 + 0.05) / 24 + 0.5 / 24));
+          if (!blob) throw new Error("Couldn't read that frame.");
+          await addRefs([blob]);
+          if (activeEngine() !== "comfy" && cfg.comfyEndpoint) { engine = "comfy"; store.set("engine", engine); applyEngine(); pollHealth(); }
+          showStatus(`Added as <Picture ${refs.length}>. Name it in your prompt, e.g. "<Subject 1> is the person in <Picture ${refs.length}>".`, { progress: 1 });
+          $("refsRow").scrollIntoView({ behavior: "smooth", block: "center" });
+        } catch (e) { showStatus(e.message, { error: true }); }
+        finally { asRef.disabled = false; }
+      };
+      frameRow.prepend(asRef);
       const hereEnd = document.createElement("button"); hereEnd.className = "small"; hereEnd.textContent = "This frame → End";
       hereEnd.title = "Put the frame the player is on in the Last frame (end) slot";
       hereEnd.onclick = () => useFrameHere(v, entry, "last", hereEnd);
