@@ -344,7 +344,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "b12793d 2026-10-14 17:08Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "2760515 2026-10-14 17:13Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -1439,7 +1439,9 @@ input[type], select, textarea { font-size: 16px; }
     const box = $("prompt");
     box.scrollIntoView({ behavior: "smooth", block: "center" });
     box.focus({ preventScroll: true }); box.setSelectionRange(box.value.length, box.value.length);
-    showStatus("The next video extends that one (its last 0.9 s carry over). Describe what happens next, then Generate. Duration is the new part.", { progress: 1 });
+    // The carried-over frames go straight to the video model; the text side never sees them, so the prompt should say
+    // briefly who and where (as at the end of that clip) before what happens next.
+    showStatus("The next video extends that one (its 0.9 s carry over). In the prompt, briefly say who and where, then what happens next. Duration is the new part.", { progress: 1 });
   }
 
   // The frame the player is showing, into the start or end slot. Times snap to the 24 fps frame grid: the frame
