@@ -348,7 +348,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "adb477d 2026-10-14 17:30Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "cb4fb1b 2026-10-14 17:44Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -570,7 +570,7 @@ input[type], select, textarea { font-size: 16px; }
   // Reference photos (<Picture 1>...): kept in this browser until removed, sent with every ComfyUI generation.
   const MAX_REFS = 9;
   let refs = (store.get("refs", []) || []).map((r) => (typeof r === "string" ? { url: r, desc: "" } : r));   // {url, desc}
-  // "<Subject 1> is <description> in <Picture 1> and <Picture 2>." per described photo, as MiniMax's reference guide
+  // "<Subject 1> is <name> in <Picture 1> and <Picture 2>, <rest of the description>." per described photo, as MiniMax's reference guide
   // writes them; photos with the same description are one subject. Sent before the prompt.
   function refDefinitions() {
     const groups = new Map();
@@ -580,7 +580,13 @@ input[type], select, textarea { font-size: 16px; }
       if (!groups.has(desc.toLowerCase())) groups.set(desc.toLowerCase(), { desc, pics: [] });
       groups.get(desc.toLowerCase()).pics.push(`<Picture ${i + 1}>`);
     });
-    return [...groups.values()].map((g, n) => `<Subject ${n + 1}> is ${g.desc} in ${g.pics.join(" and ")}.`).join(" ");
+    // the pictures go right after the name or main noun (before the first comma), as in MiniMax's examples:
+    // "<Subject 1> is Mia in <Picture 1>, a woman in a red coat."
+    return [...groups.values()].map((g, n) => {
+      const pics = `in ${g.pics.join(" and ")}`, comma = g.desc.indexOf(",");
+      const body = comma > 0 ? `${g.desc.slice(0, comma)} ${pics}${g.desc.slice(comma)}` : `${g.desc} ${pics}`;
+      return `<Subject ${n + 1}> is ${body}.`;
+    }).join(" ");
   }
   // "Over here!" -> <d>[English] Over here!</d>: H3's dialogue tags (dedicated tokens in its tokenizer); plain quotes
   // would be read as on-screen text. "[French] Bonjour" keeps its language; lines already in <d>...</d> stay as they are.
