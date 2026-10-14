@@ -76,12 +76,14 @@ button.small { padding: 5px 10px; font-size: 13px; }
 button.full { width: 100%; }
 .hint { color: var(--mute); font-size: 13px; margin: 6px 0 0; }
 .frames { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.refs { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; }
-.ref { position: relative; aspect-ratio: 1; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--sunken); cursor: pointer; }
-.ref img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.ref .tag { position: absolute; left: 0; right: 0; bottom: 0; font-size: 11px; padding: 2px 4px; background: rgba(0,0,0,.6); color: #fff; text-align: center; }
-.ref .x { position: absolute; top: 3px; right: 3px; padding: 0 6px; font-size: 12px; }
-.ref.add { display: grid; place-items: center; border-style: dashed; color: var(--mute); font-size: 13px; text-align: center; }
+.refs { display: grid; gap: 8px; }
+.ref { display: flex; align-items: center; gap: 8px; }
+.ref .thumb { position: relative; flex: 0 0 64px; height: 64px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--sunken); cursor: pointer; }
+.ref .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ref .tag { position: absolute; left: 0; right: 0; bottom: 0; font-size: 10px; padding: 1px 2px; background: rgba(0,0,0,.6); color: #fff; text-align: center; }
+.ref input { flex: 1; min-width: 0; }
+.ref .x { flex: 0 0 auto; }
+.refs-preview { font-size: 12px; color: var(--mute); margin: 6px 0 0; overflow-wrap: anywhere; }
 .frame { position: relative; border: 1px dashed var(--line); border-radius: 10px; background: var(--sunken); aspect-ratio: 16 / 10; display: grid; place-items: center; overflow: hidden; cursor: pointer; color: var(--mute); font-size: 13px; text-align: center; padding: 6px; }
 .frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .frame .x { position: absolute; top: 4px; right: 4px; z-index: 1; padding: 2px 8px; font-size: 12px; }
@@ -163,6 +165,7 @@ input[type], select, textarea { font-size: 16px; }
       <h2>Shot</h2>
       <label for="prompt">Prompt</label>
       <textarea id="prompt" placeholder="A red fox trotting through a snowy pine forest at dawn, snow crunching underfoot"></textarea>
+      <p class="refs-preview" id="promptPreview"></p>
 
       <div id="engineRow" class="hidden">
         <label for="engine">Engine</label>
@@ -199,8 +202,9 @@ input[type], select, textarea { font-size: 16px; }
 
       <div id="refsRow" class="hidden">
         <label>References (optional)</label>
-        <p class="hint" style="margin:0 0 6px">People, outfits, places or things to keep consistent (ComfyUI engine; kept until you remove them). Define each once, then use the subject: <i>&lt;Subject 1&gt; is the woman in &lt;Picture 1&gt;.</i> Tap a photo to insert its tag. Spoken lines go in <i>&lt;d&gt;[English] Over here!&lt;/d&gt;</i>; plain "quotes" become on-screen text.</p>
+        <p class="hint" style="margin:0 0 6px">People, outfits, places or things to keep consistent (ComfyUI engine; kept until you remove them). Describe each one, e.g. <i>Mia, a woman with long dark hair and a red wool coat</i>, then just write <i>Mia</i> in your prompt: the definitions are added for you. Photos with the same description are one subject. Spoken lines go in <i>&lt;d&gt;[English] Over here!&lt;/d&gt;</i>; plain "quotes" become on-screen text.</p>
         <div class="refs" id="refs"></div>
+        <p class="refs-preview" id="refsPreview"></p>
         <input type="file" id="refInput" accept="image/*" multiple class="hidden">
       </div>
 
@@ -344,7 +348,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "2760515 2026-10-14 17:13Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "adb477d 2026-10-14 17:30Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -450,6 +454,7 @@ input[type], select, textarea { font-size: 16px; }
     const e = activeEngine();
     $("engineRow").classList.toggle("hidden", !cfg.comfyEndpoint);
     $("refsRow").classList.toggle("hidden", e !== "comfy");
+    setTimeout(showPromptPreview);                     // after start-up: the references are read further down
     $("engine").value = e;
     applyServerConfig(ENGINE_DEFAULTS[e]);
     const saved = store.get(engineKey("serverConfig", e), null);
@@ -564,26 +569,71 @@ input[type], select, textarea { font-size: 16px; }
 
   // Reference photos (<Picture 1>...): kept in this browser until removed, sent with every ComfyUI generation.
   const MAX_REFS = 9;
-  let refs = store.get("refs", []) || [];
+  let refs = (store.get("refs", []) || []).map((r) => (typeof r === "string" ? { url: r, desc: "" } : r));   // {url, desc}
+  // "<Subject 1> is <description> in <Picture 1> and <Picture 2>." per described photo, as MiniMax's reference guide
+  // writes them; photos with the same description are one subject. Sent before the prompt.
+  function refDefinitions() {
+    const groups = new Map();
+    refs.forEach((r, i) => {
+      const desc = (r.desc || "").trim().replace(/[.\s]+$/, "");
+      if (!desc) return;
+      if (!groups.has(desc.toLowerCase())) groups.set(desc.toLowerCase(), { desc, pics: [] });
+      groups.get(desc.toLowerCase()).pics.push(`<Picture ${i + 1}>`);
+    });
+    return [...groups.values()].map((g, n) => `<Subject ${n + 1}> is ${g.desc} in ${g.pics.join(" and ")}.`).join(" ");
+  }
+  // "Over here!" -> <d>[English] Over here!</d>: H3's dialogue tags (dedicated tokens in its tokenizer); plain quotes
+  // would be read as on-screen text. "[French] Bonjour" keeps its language; lines already in <d>...</d> stay as they are.
+  function dialogueTags(text) {
+    return text.split(/(<d>[\s\S]*?<\/d>)/).map((part, i) => i % 2 ? part :
+      part.replace(/"([^"\n]+)"|\u201c([^\u201d\n]+)\u201d/g, (_, straight, curly) => {
+        const line = (straight ?? curly).trim();
+        return /^\[[^\]]+\]/.test(line) ? `<d>${line}</d>` : `<d>[English] ${line}</d>`;
+      })).join("");
+  }
+  // What the model receives for a prompt: on ComfyUI, the reference definitions first (if any photo is described)
+  // and dialogue tags; the Ultra engine gets the prompt as written.
+  function modelPrompt(prompt) {
+    if (activeEngine() !== "comfy") return prompt;
+    const defs = refs.length ? refDefinitions() : "";
+    return (defs ? `${defs}\n` : "") + dialogueTags(prompt);
+  }
+  function showPromptPreview() {
+    const typed = $("prompt").value.trim(), sent = typed ? modelPrompt(typed) : "";
+    $("promptPreview").textContent = sent && sent !== typed ? `Sent as: ${sent}` : "";
+  }
+  $("prompt").addEventListener("input", showPromptPreview);
+  function showRefsPreview() {
+    const defs = refDefinitions();
+    $("refsPreview").textContent = defs ? `Added before your prompt: ${defs}` : refs.length ? "Describe the photos to have them named for you." : "";
+    showPromptPreview();
+  }
   function renderRefs() {
     const box = $("refs"); box.innerHTML = "";
-    refs.forEach((url, i) => {
-      const el = document.createElement("div"); el.className = "ref"; el.title = `Tap to insert <Picture ${i + 1}> into the prompt`;
-      el.innerHTML = `<img alt=""><span class="tag">&lt;Picture ${i + 1}&gt;</span><button class="x small" type="button" aria-label="Remove">×</button>`;
-      el.querySelector("img").src = url;
-      el.onclick = () => {
+    refs.forEach((r, i) => {
+      const el = document.createElement("div"); el.className = "ref";
+      el.innerHTML = `<div class="thumb" title="Tap to insert &lt;Picture ${i + 1}&gt; into the prompt"><img alt=""><span class="tag">&lt;Picture ${i + 1}&gt;</span></div>` +
+                     `<input type="text" placeholder="Who or what is this? e.g. Mia, a woman in a red coat" aria-label="Description of picture ${i + 1}">` +
+                     `<button class="x small" type="button" aria-label="Remove">×</button>`;
+      el.querySelector("img").src = r.url;
+      const input = el.querySelector("input");
+      input.value = r.desc || "";
+      let typing = null;
+      input.oninput = () => { r.desc = input.value; showRefsPreview(); clearTimeout(typing); typing = setTimeout(saveRefs, 400); };
+      el.querySelector(".thumb").onclick = () => {
         const p = $("prompt"), tag = `<Picture ${i + 1}>`, at = p.selectionStart ?? p.value.length;
         p.value = p.value.slice(0, at) + tag + p.value.slice(p.selectionEnd ?? at);
         p.focus(); p.setSelectionRange(at + tag.length, at + tag.length);
       };
-      el.querySelector(".x").onclick = (e) => { e.stopPropagation(); refs.splice(i, 1); saveRefs(); renderRefs(); };
+      el.querySelector(".x").onclick = () => { refs.splice(i, 1); saveRefs(); renderRefs(); };
       box.append(el);
     });
     if (refs.length < MAX_REFS) {
-      const add = document.createElement("div"); add.className = "ref add"; add.tabIndex = 0; add.textContent = "+ Add";
+      const add = document.createElement("button"); add.type = "button"; add.className = "small ref-add"; add.textContent = "+ Add reference photo";
       add.onclick = () => $("refInput").click();
       box.append(add);
     }
+    showRefsPreview();
   }
   function saveRefs() {
     store.set("refs", refs);
@@ -593,7 +643,7 @@ input[type], select, textarea { font-size: 16px; }
   async function addRefs(files) {
     for (const f of [...files].filter((x) => x.type.startsWith("image/"))) {
       if (refs.length >= MAX_REFS) { showStatus(`Up to ${MAX_REFS} reference photos.`, { error: true }); break; }
-      try { refs.push(await shrink(f, 1024)); } catch (e) { showStatus(e.message, { error: true }); }
+      try { refs.push({ url: await shrink(f, 1024), desc: "" }); } catch (e) { showStatus(e.message, { error: true }); }
     }
     saveRefs(); renderRefs();
   }
@@ -835,7 +885,9 @@ input[type], select, textarea { font-size: 16px; }
     else if (startJob && startJob.extend) base.extend_from = { job: startJob.id, ...(startJob.frame != null ? { frame: startJob.frame } : {}) };
     else if (startJob) base.start_from = { job: startJob.id };
     if (frames.last) base.last_image = frames.last;
-    if (refs.length && activeEngine() === "comfy") base.refs = refs.slice(0, MAX_REFS);
+    if (refs.length && activeEngine() === "comfy") base.refs = refs.slice(0, MAX_REFS).map((r) => r.url);
+    const sent = modelPrompt(prompt);                  // definitions + dialogue tags; the queue and History keep yours
+    if (sent !== prompt) Object.assign(base, { prompt: sent, user_prompt: prompt });
     const parent = startJob ? startJob.id : continueFrom;
     if (parent) base.parent = parent;
     if (parent && continueAt != null) base.parent_at = continueAt;
@@ -1192,7 +1244,7 @@ input[type], select, textarea { font-size: 16px; }
     await whenUnlocked();             // nothing plays or lands in History behind the lock screen
     if (epoch !== wipes) return;
     const entry = { id: Date.now(), created: new Date().toISOString(),
-                    prompt: input.kind === "join" ? (input.label || "Joined clips") : (input.prompt || "(resumed job)"),
+                    prompt: input.kind === "join" ? (input.label || "Joined clips") : (input.user_prompt || input.prompt || "(resumed job)"),
                     jobId: input.jobId || null, parentJob: input.parent || null, parentAt: input.parent_at ?? null,
                     overlap: out.overlap_frames || (input.extend_from ? EXTEND_OVERLAP : null), kind: input.kind || "generate",
                     engine: input.engine || "ultra", preset: input.preset || "", canvas: input.canvas || "", duration: input.duration, seed: out.seed ?? input.seed,
