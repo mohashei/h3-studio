@@ -285,6 +285,7 @@ input[type], select, textarea { font-size: 16px; }
     <label for="cfgCivitai">Civitai API token (optional)</label>
     <input type="password" id="cfgCivitai" autocomplete="off" placeholder="Only needed for LoRAs Civitai won't serve anonymously">
     <label class="check"><input type="checkbox" id="cfgRemember" checked> Remember on this computer</label>
+    <label class="check"><input type="checkbox" id="cfgJoinLocal" checked> Join videos on this device (no GPU worker needed; the worker joins if it can't)</label>
     <details class="frame-actions" id="debugBox">
       <summary>Debug</summary>
       <p class="hint" style="margin:6px 0">Page version <b id="buildId"></b>. The log lists every RunPod request (no keys) and what happened to each result.</p>
@@ -348,7 +349,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "cb4fb1b 2026-10-14 17:44Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "701dce8 2026-10-15 21:33Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -929,11 +930,15 @@ input[type], select, textarea { font-size: 16px; }
   // A continuation from the last frame repeats it, so its first frame is dropped; one that started from a frame in the
   // middle keeps its first frame and the previous clip is cut just before that frame instead (`end`, in seconds).
   // An extension repeats the end of the clip it extends (`overlap` frames): it starts after them instead.
-  async function clipRef(node, prev, next) {
+  function cutsFor(node, prev, next) {               // shared by the worker's join and the one on this device
     const follows = !!(prev && node.parent && node.parent === prev.id);
     const trim_first = follows && node.at == null && !node.overlap;
     const cut = { ...(next && next.parent && next.parent === node.id && next.at != null ? { end: next.at } : {}),
                   ...(follows && node.overlap ? { start: node.overlap / 24 } : {}) };
+    return { trim_first, cut };
+  }
+  async function clipRef(node, prev, next) {
+    const { trim_first, cut } = cutsFor(node, prev, next);
     const e = node.entry;
     if (node.job && !node.job.done) return { job: node.id, wait: true, trim_first, ...cut };
     if (e && e.jobId && Date.now() - new Date(e.created).getTime() < 6 * 86400e3) return { job: e.jobId, wait: false, trim_first, ...cut };
@@ -942,14 +947,91 @@ input[type], select, textarea { font-size: 16px; }
   }
   const blobB64 = (b) => new Promise((res) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.readAsDataURL(b); });
 
+  // Joining on this device: WebCodecs (the phone's hardware H.264 encoder) through Mediabunny, which reads each clip's
+  // kept range, re-encodes it and writes one mp4 (AAC audio at 48 kHz stereo, letterboxed to the first clip's size,
+  // like the worker's join). Loaded the first time it's needed. Throws if this browser can't; the caller then asks
+  // the worker.
+  let mediabunny = null;
+  async function joinHere(parts, onProgress) {
+    if (typeof VideoEncoder === "undefined" || typeof AudioEncoder === "undefined") throw new Error("this browser has no video/audio encoders");
+    const mb = mediabunny ||= await import("./vendor/mediabunny.min.mjs");
+    const open = (blob) => new mb.Input({ source: new mb.BlobSource(blob), formats: mb.ALL_FORMATS });
+    const first = open(parts[0].blob), firstVideo = await first.getPrimaryVideoTrack();
+    if (!firstVideo) throw new Error("the first clip has no video track");
+    const width = firstVideo.displayWidth, height = firstVideo.displayHeight;
+    if (!(await mb.canEncodeVideo("avc", { width, height }))) throw new Error(`no H.264 encoder for ${width}x${height}`);
+    if (!(await mb.canEncodeAudio("aac", { numberOfChannels: 2, sampleRate: 48000 }))) throw new Error("no AAC audio encoder");
+    const target = new mb.BufferTarget();
+    const output = new mb.Output({ format: new mb.Mp4OutputFormat({ fastStart: "in-memory" }), target });
+    const video = new mb.VideoSampleSource({ codec: "avc", bitrate: mb.QUALITY_HIGH, sizeChangeBehavior: "contain" });
+    const audio = new mb.AudioSampleSource({ codec: "aac", bitrate: 192e3, transform: { sampleRate: 48000, numberOfChannels: 2 } });
+    output.addVideoTrack(video, { frameRate: 24 });
+    output.addAudioTrack(audio);
+    await output.start();
+    let at = 0;                                        // where this clip starts in the joined video, seconds
+    try {
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i], input = i ? open(p.blob) : first;
+      const vt = i ? await input.getPrimaryVideoTrack() : firstVideo, au = await input.getPrimaryAudioTrack();
+      if (!vt) throw new Error(`clip ${i + 1} has no video track`);
+      const duration = await input.computeDuration();
+      const start = p.start || 0, end = p.end != null ? Math.min(p.end, duration) : duration;
+      if (end > start) {
+        // each frame / audio chunk is closed even if adding it fails (they hold decoder memory)
+        for await (const s of new mb.VideoSampleSink(vt).samples(start, end)) {
+          try { s.setTimestamp(at + s.timestamp - start); await video.add(s); } finally { s.close(); }
+        }
+        if (au) for await (const s of new mb.AudioSampleSink(au).samples(start, end)) {
+          try { if (s.timestamp >= start) { s.setTimestamp(at + s.timestamp - start); await audio.add(s); } } finally { s.close(); }   // a chunk from before the cut is dropped
+        }
+        at += end - start;
+      }
+      if (onProgress) onProgress(i + 1, parts.length);
+    }
+    } catch (e) { await output.cancel().catch(() => {}); throw e; }
+    video.close(); audio.close();
+    await output.finalize();
+    return { blob: new Blob([target.buffer], { type: "video/mp4" }), seconds: at };
+  }
+  // The clips for a join on this device, with their cuts; null if any isn't in History on this device yet.
+  function localParts(nodes) {
+    const parts = [];
+    for (let i = 0; i < nodes.length; i++) {
+      const blob = nodes[i].entry && nodes[i].entry.blob;
+      if (!blob) return null;
+      const { trim_first, cut } = cutsFor(nodes[i], nodes[i - 1], nodes[i + 1]);
+      parts.push({ blob, start: Math.max(trim_first ? 1 / 24 : 0, cut.start || 0), end: cut.end });
+    }
+    return parts;
+  }
+
   async function queueJoin(nodes, why) {
     if (nodes.length < 2) { showStatus("A join needs at least two clips.", { error: true }); return; }
+    const label = `Join ${nodes.length}: ${why}`.slice(0, 70);
+    const parts = store.get("joinLocal", true) ? localParts(nodes) : null;
+    if (parts) {
+      const started = performance.now();
+      try {
+        showStatus(`Joining ${nodes.length} clips on this device…`, { progress: 0 });
+        const { blob, seconds } = await joinHere(parts, (done, n) => showStatus(`Joining on this device: clip ${done} of ${n}…`, { progress: done / n }));
+        const took = (performance.now() - started) / 1000;
+        dbg(`${label}: joined on this device, ${seconds.toFixed(1)} s of video in ${took.toFixed(1)} s`);
+        autoShown = false;                             // the result plays
+        await showResult({ blob, summary: `joined ${nodes.length} clips (${seconds.toFixed(1)} s) on this device in ${took < 10 ? took.toFixed(1) : Math.round(took)} s` },
+                         { kind: "join", label, jobId: null });
+        showStatus(`Joined ${nodes.length} clips on this device.`, { progress: 1 });
+        return;
+      } catch (e) {
+        dbg(`${label}: joining on this device failed (${e.message}); asking the worker`);
+        showStatus(`Joining on this device didn't work (${e.message}); asking the worker instead.`, { error: true });
+      }
+    }
     try {
       const clips = [];
       for (let i = 0; i < nodes.length; i++) clips.push(await clipRef(nodes[i], nodes[i - 1], nodes[i + 1]));
       const size = clips.reduce((a, c) => a + (c.b64 ? c.b64.length : 0), 0);
       if (size > 9e6) throw new Error("Too much video to upload in one join; join fewer older clips at a time.");
-      await submit("join", { action: "join", clips }, `Join ${nodes.length}: ${why}`.slice(0, 70));
+      await submit("join", { action: "join", clips }, label);
       showStatus(`Join of ${nodes.length} clips queued.`);
     } catch (e) { showStatus(e.message, { error: true }); }
   }
@@ -1243,6 +1325,8 @@ input[type], select, textarea { font-size: 16px; }
         blob = await downloadStored(out, input.ep, label, stats);
         summary = downloadSummary(out.size, secs(), stats, false) + " — storage link failed";
       }
+    } else if (out.blob instanceof Blob) {             // joined on this device
+      blob = out.blob; summary = out.summary || "";
     } else if (out.stored) {
       blob = await downloadStored(out, input.ep, input.label || "video", stats);
       summary = downloadSummary(out.size, (performance.now() - started) / 1000, stats, false);
@@ -1626,6 +1710,7 @@ input[type], select, textarea { font-size: 16px; }
   function openSettings() {
     $("cfgEndpoint").value = cfg.endpoint; $("cfgComfy").value = cfg.comfyEndpoint || ""; $("cfgRunpod").value = cfg.runpodKey; $("cfgH3").value = cfg.h3Key;
     $("cfgCivitai").value = cfg.civitaiToken || "";
+    $("cfgJoinLocal").checked = store.get("joinLocal", true);
     $("buildId").textContent = BUILD; $("debugView").textContent = debugLog.slice(-200).join("\n");
     dlg.showModal();
   }
@@ -1638,6 +1723,7 @@ input[type], select, textarea { font-size: 16px; }
     setTimeout(() => ($("copyLog").textContent = "Copy debug log"), 2500);
   };
   $("clearLog").onclick = () => { debugLog.length = 0; store.set("debugLog", debugLog); $("debugView").textContent = ""; };
+  $("cfgJoinLocal").onchange = () => store.set("joinLocal", $("cfgJoinLocal").checked);
   $("settingsForm").onsubmit = () => {
     cfg = { endpoint: $("cfgEndpoint").value.trim(), comfyEndpoint: $("cfgComfy").value.trim(), runpodKey: $("cfgRunpod").value.trim(),
             h3Key: $("cfgH3").value.trim(), civitaiToken: $("cfgCivitai").value.trim() };
