@@ -349,7 +349,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "701dce8 2026-10-15 21:33Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "6f38eaa 2026-10-19 06:11Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -878,6 +878,7 @@ input[type], select, textarea { font-size: 16px; }
     const { image, last_image, clips, refs: refPhotos, ...meta } = input;   // keep localStorage small
     if (refPhotos) meta.ref_count = refPhotos.length;
     if (clips) meta.clips = clips.map(({ b64, ...c }) => c);
+    if (meta.extend_from && meta.extend_from.b64) meta.extend_from = { sent: true };
     queue.push({ id: job.id, ep, kind, label, seed: seedValue, input: meta, state: "IN_QUEUE", text: "Queued", done: false, t: Date.now() });
     saveQueue(); renderQueue(); ensurePolling();
     return job.id;
@@ -889,6 +890,10 @@ input[type], select, textarea { font-size: 16px; }
     if (!prompt) { $("prompt").focus(); showStatus("Write a prompt first.", { error: true }); return; }
     const base = { action: "generate", engine: activeEngine(), prompt, preset: presetSel.value, canvas: canvasSel.value, duration: Number(duration.value) };
     if (frames.first) base.image = frames.first;
+    else if (startJob && startJob.extend && startJob.blob) {          // only on this device: send the end of it
+      try { showStatus("Cutting the end of the video to send…"); base.extend_from = await extendSource(startJob); }
+      catch (e) { showStatus(e.message, { error: true }); return; }
+    }
     else if (startJob && startJob.extend) base.extend_from = { job: startJob.id, ...(startJob.frame != null ? { frame: startJob.frame } : {}) };
     else if (startJob) base.start_from = { job: startJob.id };
     if (frames.last) base.last_image = frames.last;
@@ -918,7 +923,8 @@ input[type], select, textarea { font-size: 16px; }
   // Clips that lead up to `id` through Continue links, oldest first (queued jobs and History both count).
   async function chainTo(id) {
     const hist = await db.all(), byJob = new Map();
-    for (const e of hist) if (e.jobId) byJob.set(e.jobId, { id: e.jobId, parent: e.parentJob, at: e.parentAt ?? null, overlap: e.overlap ?? null, entry: e, label: e.prompt });
+    for (const e of hist) { const key = e.jobId || `local-${e.id}`;    // made on this device: no job id
+      byJob.set(key, { id: key, parent: e.parentJob, at: e.parentAt ?? null, overlap: e.overlap ?? null, entry: e, label: e.prompt }); }
     for (const j of queue) if (j.kind === "generate" && !byJob.has(j.id)) byJob.set(j.id, { id: j.id, parent: j.input.parent, at: j.input.parent_at ?? null, overlap: j.input.extend_from ? EXTEND_OVERLAP : null, job: j, label: j.label });
     const chain = [];
     for (let cur = byJob.get(id); cur && chain.length < 24; cur = cur.parent ? byJob.get(cur.parent) : null) chain.unshift(cur);
@@ -952,7 +958,7 @@ input[type], select, textarea { font-size: 16px; }
   // like the worker's join). Loaded the first time it's needed. Throws if this browser can't; the caller then asks
   // the worker.
   let mediabunny = null;
-  async function joinHere(parts, onProgress) {
+  async function joinHere(parts, onProgress, quality = null) {
     if (typeof VideoEncoder === "undefined" || typeof AudioEncoder === "undefined") throw new Error("this browser has no video/audio encoders");
     const mb = mediabunny ||= await import("./vendor/mediabunny.min.mjs");
     const open = (blob) => new mb.Input({ source: new mb.BlobSource(blob), formats: mb.ALL_FORMATS });
@@ -963,8 +969,8 @@ input[type], select, textarea { font-size: 16px; }
     if (!(await mb.canEncodeAudio("aac", { numberOfChannels: 2, sampleRate: 48000 }))) throw new Error("no AAC audio encoder");
     const target = new mb.BufferTarget();
     const output = new mb.Output({ format: new mb.Mp4OutputFormat({ fastStart: "in-memory" }), target });
-    const video = new mb.VideoSampleSource({ codec: "avc", bitrate: mb.QUALITY_HIGH, sizeChangeBehavior: "contain" });
-    const audio = new mb.AudioSampleSource({ codec: "aac", bitrate: 192e3, transform: { sampleRate: 48000, numberOfChannels: 2 } });
+    const video = new mb.VideoSampleSource({ codec: "avc", bitrate: quality || mb.QUALITY_HIGH, sizeChangeBehavior: "contain" });
+    const audio = new mb.AudioSampleSource({ codec: "aac", bitrate: 192e3 });   // always 48 kHz stereo (segmentAudio)
     output.addVideoTrack(video, { frameRate: 24 });
     output.addAudioTrack(audio);
     await output.start();
@@ -975,14 +981,15 @@ input[type], select, textarea { font-size: 16px; }
       const vt = i ? await input.getPrimaryVideoTrack() : firstVideo, au = await input.getPrimaryAudioTrack();
       if (!vt) throw new Error(`clip ${i + 1} has no video track`);
       const duration = await input.computeDuration();
-      const start = p.start || 0, end = p.end != null ? Math.min(p.end, duration) : duration;
+      const end = p.end != null ? Math.min(p.end, duration) : duration;
+      const start = p.tail ? Math.max(0, end - p.tail) : p.start || 0;    // `tail`: just the last seconds before `end`
       if (end > start) {
         // each frame / audio chunk is closed even if adding it fails (they hold decoder memory)
         for await (const s of new mb.VideoSampleSink(vt).samples(start, end)) {
           try { s.setTimestamp(at + s.timestamp - start); await video.add(s); } finally { s.close(); }
         }
-        if (au) for await (const s of new mb.AudioSampleSink(au).samples(start, end)) {
-          try { if (s.timestamp >= start) { s.setTimestamp(at + s.timestamp - start); await audio.add(s); } } finally { s.close(); }   // a chunk from before the cut is dropped
+        for (const s of mb.AudioSample.fromAudioBuffer(await segmentAudio(mb, au, start, end), at)) {
+          try { await audio.add(s); } finally { s.close(); }
         }
         at += end - start;
       }
@@ -993,6 +1000,49 @@ input[type], select, textarea { font-size: 16px; }
     await output.finalize();
     return { blob: new Blob([target.buffer], { type: "video/mp4" }), seconds: at };
   }
+  // Extending a video the worker doesn't have (joined on this device, or gone from its store after ~a week): the end of
+  // it is cut here and sent with the request. 1.5 s ending at the chosen frame (or the end) is plenty for the 22 frames
+  // the worker carries over, and well under RunPod's 10 MB request limit. Without encoders, the whole clip if it fits.
+  async function extendSource(job) {
+    const end = job.frame != null ? (job.frame + 0.5) / 24 : undefined;             // through frame n, not n + 1
+    try {
+      const mb = mediabunny ||= await import("./vendor/mediabunny.min.mjs");
+      const { blob } = await joinHere([{ blob: job.blob, end, tail: 1.5 }], null, mb.QUALITY_VERY_HIGH);
+      return { b64: await blobB64(blob) };
+    } catch (e) {
+      dbg(`cutting the end of "${job.label}" here failed (${e.message}); sending the whole clip`);
+      if (job.blob.size > 7e6) throw new Error("This video is only on this device and is too big to send whole for extending.");
+      return { b64: await blobB64(job.blob), ...(job.frame != null ? { frame: job.frame } : {}) };
+    }
+  }
+
+  // A clip's sound from `start` to `end`, cut to the sample and resampled to 48 kHz stereo by the browser (the encoder
+  // needs every clip's audio alike); silence for a clip without sound, so picture and sound stay in step.
+  async function segmentAudio(mb, au, start, end) {
+    const RATE = 48000, frames = Math.max(1, Math.round((end - start) * RATE));
+    const ctx = new OfflineAudioContext(2, frames, RATE);
+    let planes = null, rate = 0;
+    if (au) for await (const s of new mb.AudioSampleSink(au).samples(start, end)) {
+      try {
+        if (!planes) { rate = s.sampleRate; planes = Array.from({ length: s.numberOfChannels }, () => new Float32Array(Math.round((end - start) * rate))); }
+        const at = Math.round((s.timestamp - start) * rate);            // where it goes (negative: it begins before the cut)
+        const from = Math.max(0, -at), count = Math.min(s.numberOfFrames, planes[0].length - at) - from;
+        if (count <= 0 || s.sampleRate !== rate) continue;
+        planes.forEach((plane, c) => {
+          const part = new Float32Array(count);
+          s.copyTo(part, { planeIndex: c, format: "f32-planar", frameOffset: from, frameCount: count });
+          plane.set(part, at + from);
+        });
+      } finally { s.close(); }
+    }
+    if (planes && planes[0].length) {
+      const buffer = ctx.createBuffer(planes.length, planes[0].length, rate);
+      planes.forEach((plane, c) => buffer.copyToChannel(plane, c));
+      const src = ctx.createBufferSource(); src.buffer = buffer; src.connect(ctx.destination); src.start();
+    }
+    return ctx.startRendering();
+  }
+
   // The clips for a join on this device, with their cuts; null if any isn't in History on this device yet.
   function localParts(nodes) {
     const parts = [];
@@ -1484,14 +1534,16 @@ input[type], select, textarea { font-size: 16px; }
       here.title = "Pause the video on a frame, then start the next video from it";
       here.onclick = () => useFrameHere(v, entry, "first", here, () => cont.click());
       cont.after(here);
+      // The worker extends from its stored copy; a video it doesn't have is sent from here (its end; see extendSource)
       const stored = entry.jobId && Date.now() - new Date(entry.created).getTime() < 6 * 86400e3;
-      if (stored && cfg.comfyEndpoint) {
+      const source = { id: entry.jobId || `local-${entry.id}`, label: entry.prompt, done: true, ...(stored ? {} : { blob: entry.blob }) };
+      if ((stored || entry.blob) && cfg.comfyEndpoint) {
         const ext = document.createElement("button"); ext.className = "small primary"; ext.textContent = "Extend";
         ext.title = "Continue this video with its last 0.9 s (motion and sound) carried over; ComfyUI engine";
         ext.onclick = async () => {
           let preview = null;
           try { preview = (await grabFrame(entry.blob, "last", 480)).toDataURL("image/jpeg", 0.85); } catch {}
-          extendJob({ id: entry.jobId, label: entry.prompt, done: true }, preview);
+          extendJob({ ...source }, preview);
         };
         here.after(ext);
         const extHere = document.createElement("button"); extHere.className = "small"; extHere.textContent = "Extend from this frame";
@@ -1506,14 +1558,14 @@ input[type], select, textarea { font-size: 16px; }
           if (n < EXTEND_OVERLAP - 1) { showStatus("Pause at least 0.9 s into the clip to extend from there.", { error: true }); return; }
           let preview = null;
           try { preview = (await grabFrame(entry.blob, (n + 0.5) / fps, 480)).toDataURL("image/jpeg", 0.85); } catch {}
-          extendJob({ id: entry.jobId, label: entry.prompt, done: true, frame: n }, preview);
+          extendJob({ ...source, frame: n }, preview);
         };
         ext.after(extHere);
       }
       if (entry.parentJob) {
         const jc = document.createElement("button"); jc.className = "small"; jc.textContent = "Join chain";
         jc.title = "Join this clip with the clips it continues from, in order";
-        jc.onclick = () => joinChain(entry.jobId);
+        jc.onclick = () => joinChain(entry.jobId || `local-${entry.id}`);
         cont.after(jc);
       }
       const more = document.createElement("details"); more.className = "frame-actions";
