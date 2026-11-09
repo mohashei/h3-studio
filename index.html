@@ -349,7 +349,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "6f38eaa 2026-10-19 06:11Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "8d0009c 2026-11-09 18:54Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -509,6 +509,32 @@ input[type], select, textarea { font-size: 16px; }
     box.querySelector(".paste").onclick = (e) => { e.stopPropagation(); lastSlot = which; pasteFromClipboard(which); };
   }
 
+  const canvasDims = (label) => { const m = /(\d+)\s*x\s*(\d+)/.exec(String(label || "")); return m ? { w: +m[1], h: +m[2] } : null; };
+  const imageSize = (url) => new Promise((done) => {
+    const img = new Image();
+    img.onload = () => done({ w: img.naturalWidth, h: img.naturalHeight });
+    img.onerror = () => done(null);
+    img.src = url;
+  });
+
+  /** A keyframe decides the shape of the video, so move Format to the option that matches it (same size tier)
+   *  instead of stretching the picture into the format that happened to be chosen. */
+  function matchCanvasTo(w, h) {
+    const now = canvasDims(canvasSel.value);
+    if (!now || !w || !h) return;
+    const want = w / h;
+    if (Math.abs(now.w / now.h - want) < 0.02) return;                      // the format already has that shape
+    const budget = now.w * now.h;
+    let best = null;
+    for (const o of [...canvasSel.options].map((o) => ({ label: o.value, ...canvasDims(o.value) })).filter((o) => o.w)) {
+      const off = Math.abs(o.w / o.h - want), size = Math.abs(o.w * o.h - budget);   // nearest shape, then nearest size
+      if (!best || off < best.off - 0.02 || (off < best.off + 0.02 && size < best.size)) best = { ...o, off, size };
+    }
+    if (!best || best.label === canvasSel.value) return;
+    canvasSel.value = best.label; store.set("canvas", best.label);
+    showStatus(`Format set to ${best.label.split(" \u00b7 ")[0]} to match the keyframe (${w}\u00d7${h}).`, { progress: 1 });
+  }
+
   // Returns false (and says why) if the image couldn't be used. A new start frame drops any continuation link;
   // Continue and "Start from this frame" set theirs again after this.
   async function setFrame(which, blob, ticket = ++frameTicket[which]) {
@@ -522,6 +548,12 @@ input[type], select, textarea { font-size: 16px; }
     box.innerHTML = `<img alt=""><button class="x small" type="button" aria-label="Remove">×</button>`;
     box.querySelector("img").src = frames[which];
     box.querySelector(".x").onclick = (e) => { e.stopPropagation(); emptySlot(which); };
+    // the start frame sets the format; an end frame only when there is no start frame to take it from
+    if (which === "first" || !(frames.first || startJob)) {
+      const size = await imageSize(image);
+      if (ticket !== frameTicket[which]) return false;
+      if (size) matchCanvasTo(size.w, size.h);
+    }
     return true;
   }
 
