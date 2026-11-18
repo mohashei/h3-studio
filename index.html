@@ -349,7 +349,7 @@ input[type], select, textarea { font-size: 16px; }
   let cfg = { endpoint: "", runpodKey: "", h3Key: "" };     // filled in after the PIN unlocks the stored copy
 
   // ---------------------------------------------------------------- RunPod queue API
-  const BUILD = "8d0009c 2026-11-09 18:54Z";                        // replaced by scripts/publish_web.sh
+  const BUILD = "c7c2545 2026-11-18 18:32Z";                        // replaced by scripts/publish_web.sh
   const debugLog = store.get("debugLog", []);
   let debugSave = null;
   function dbg(msg) {
@@ -1099,9 +1099,10 @@ input[type], select, textarea { font-size: 16px; }
         const took = (performance.now() - started) / 1000;
         dbg(`${label}: joined on this device, ${seconds.toFixed(1)} s of video in ${took.toFixed(1)} s`);
         autoShown = false;                             // the result plays
+        notKept = false;
         await showResult({ blob, summary: `joined ${nodes.length} clips (${seconds.toFixed(1)} s) on this device in ${took < 10 ? took.toFixed(1) : Math.round(took)} s` },
                          { kind: "join", label, jobId: null });
-        showStatus(`Joined ${nodes.length} clips on this device.`, { progress: 1 });
+        if (!notKept) showStatus(`Joined ${nodes.length} clips on this device.`, { progress: 1 });
         return;
       } catch (e) {
         dbg(`${label}: joining on this device failed (${e.message}); asking the worker`);
@@ -1429,11 +1430,17 @@ input[type], select, textarea { font-size: 16px; }
       const at = (e) => { const i = queue.findIndex((j) => j.id === e.jobId); return i < 0 ? Infinity : i; };
       pending.push(entry); pending.sort((a, b) => at(a) - at(b)); showNext();
     }
-    if (blob) { await db.put(entry); renderHistory(); }
+    if (blob) {
+      if (await db.put(entry)) renderHistory();
+      else {
+        notKept = true; summary = `${summary ? summary + " · " : ""}NOT kept in History: this device is out of room`;
+        showStatus("This device is out of room for History, so this video wasn't kept. Save it now (Share → Save Video), then delete some old clips in History.", { error: true });
+      }
+    }
     if (summary) dbg(`${input.label}: ${summary}`);
     return summary;
   }
-  let autoShown = false;
+  let autoShown = false, notKept = false;   // notKept: the last result couldn't be saved (its warning stays up)
   const pending = [];
   function dropPending(entry) {          // by id: History hands over fresh copies of its entries
     const i = pending.findIndex((p) => p.id === entry.id);
@@ -1721,7 +1728,13 @@ input[type], select, textarea { font-size: 16px; }
     };
     return {
       all: async () => ((await tx("readonly", (s) => s.getAll())) || []).sort((a, b) => b.id - a.id),
-      put: async (e) => { await tx("readwrite", (s) => s.put(e)); const all = await db.all(); for (const old of all.slice(40)) await db.del(old.id); },
+      // Nothing is ever deleted behind your back: true if saved, false if the device refused (storage full).
+      put: async (e) => { const d = await open(); if (!d) return false;
+        return new Promise((resolve) => {
+          try { const t = d.transaction("videos", "readwrite"); t.objectStore("videos").put(e);
+                t.oncomplete = () => resolve(true); t.onerror = t.onabort = () => resolve(false); }
+          catch { resolve(false); }
+        }); },
       del: (id) => tx("readwrite", (s) => s.delete(id)),
       get: (id) => tx("readonly", (s) => s.get(id)),
     };
